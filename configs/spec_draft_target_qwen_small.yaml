@@ -1,0 +1,4 @@
+speculative_config:
+  decoding_type: DraftTarget
+  max_draft_len: 3
+  speculative_model: Qwen/Qwen3-0.6B
