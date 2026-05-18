@@ -314,3 +314,96 @@ ssh-ed25519 ...
 ```
 
 The Vast instance needs the **private** key. GitHub receives the **public** key as a repo deploy key.
+
+
+## Safe Benchmark Planning
+
+All benchmark runner scripts now use the shared planner:
+
+```bash
+benchmark/plan_safe_tests.py
+```
+
+The planner does **not** change any files by itself. It reads the current GPU memory from `nvidia-smi`, estimates the model KV-cache cost from the model config when possible, and marks each `(context_len, concurrency)` pair as `RUN` or `SKIP`.
+
+The main safety rule is:
+
+```text
+context_len + max_new_tokens + safety_tokens <= server_max_seq_len
+```
+
+This prevents hangs such as running `context_len=512` with `max_new_tokens=64` on a server started with `MAX_SEQ_LEN=512`.
+
+The shared runner:
+
+```bash
+scripts/run_benchmark_grid.sh
+```
+
+calls the planner first, saves the full plan JSON under `results/`, and only runs the safe cases. The following scripts use the same safety logic:
+
+- `scripts/run_smoke_benchmark.sh`
+- `scripts/run_spec_smoke_benchmark.sh`
+- `scripts/run_final_baseline_benchmark.sh`
+- `scripts/run_final_draft_target_benchmark.sh`
+
+Example for a small server started with `MAX_SEQ_LEN=512`:
+
+```bash
+SERVER_MAX_SEQ_LEN=512 \
+DECODE_MODE=draft_target \
+MODEL_NAME=Qwen3-1.7B \
+bash scripts/run_spec_smoke_benchmark.sh
+```
+
+The planner will skip unsafe cases like `context_len=512` because the prompt plus generated tokens and safety buffer exceed the server limit.
+
+To inspect a plan without running the benchmark:
+
+```bash
+python3 benchmark/plan_safe_tests.py \
+  --model /workspace/models/Qwen3-1.7B \
+  --tp-size 1 \
+  --server-max-seq-len 512 \
+  --max-new-tokens 64 \
+  --contexts 128,256,512,1024 \
+  --concurrency 1,2 \
+  --format summary
+```
+
+## Assignment Runner: TensorRT-LLM + Qwen3-Coder-480B NVFP4
+
+The assignment requires TensorRT-LLM evaluation on the Qwen3-Coder-480B 4-bit model with RTX 6000 PRO Blackwell GPUs. The required context windows are 1k, 8k, 32k, 64k, and 128k, and the required metrics include TTFT, TPS mean/P99, max concurrency, VRAM idle/load, KV-cache growth, runtime stability, GPU utilization, multi-user scalability, and latency/throughput tradeoffs.
+
+Use the assignment-specific baseline runner instead of the generic smoke-test scripts:
+
+```bash
+RESET_RESULTS=1 bash scripts/run_assignment_baseline.sh
+```
+
+This script explicitly runs these assignment stages:
+
+```text
+short_1k_multiuser:     context 1k,    concurrency 1/2/4/8
+medium_8k_multiuser:    context 8k,    concurrency 1/2/4
+long_32k:               context 32k,   concurrency 1/2
+long_64k:               context 64k,   concurrency 1
+long_128k:              context 128k,  concurrency 1
+```
+
+The script starts a fresh TensorRT-LLM server for each context group with a large enough `MAX_SEQ_LEN`, then runs the benchmark. The safe planner is still used, but it should not skip the required contexts unless the case is truly unsafe due to memory or configuration. If 64k or 128k fails, keep the server log and report it as the scalability/stability limit.
+
+After the run, summarize the assignment metrics:
+
+```bash
+bash scripts/run_assignment_summary.sh
+```
+
+Main outputs:
+
+```text
+results/assignment_tensorrt_llm_qwen480b_baseline.csv
+results/assignment_summary.csv
+results/server_logs/
+results/metrics/
+```

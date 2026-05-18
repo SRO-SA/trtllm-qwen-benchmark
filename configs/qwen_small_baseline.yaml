@@ -1,0 +1,5 @@
+enable_iter_perf_stats: true
+
+kv_cache_config:
+  free_gpu_memory_fraction: 0.20
+  max_tokens: 1024

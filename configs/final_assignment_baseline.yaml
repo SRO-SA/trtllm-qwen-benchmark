@@ -1,0 +1,6 @@
+enable_iter_perf_stats: true
+
+kv_cache_config:
+  # Conservative initial setting for the 480B NVFP4 model.
+  # Increase only if TensorRT-LLM logs show there is enough free VRAM.
+  free_gpu_memory_fraction: 0.70
