@@ -439,3 +439,40 @@ bash scripts/run_assignment_baseline.sh
 ```
 
 If a required 64k or 128k assignment case fails, the CSV will contain a `runtime_stability=fail` row and `error_messages` will record the failure reason such as `case_timeout_after_2400s`. The corresponding logs and diagnostic files are saved under `results/server_logs/`, `results/metrics/`, and `results/diagnostics/`.
+
+## Real 480B assignment-runner fixes
+
+The final assignment runner includes two important safety fixes learned from the real 4× RTX PRO 6000 Blackwell test:
+
+1. **Tokenizer-aware prompt generation.** The benchmark client uses the local model tokenizer through `TOKENIZER_PATH` and keeps prompt length below the requested context window using `PROMPT_TOKEN_RESERVE`. This avoids accidental 50k+ token prompts when the target context is 32k.
+
+2. **Separate `max_num_tokens` control.** TensorRT-LLM PyTorch backend may keep `max_num_tokens=8192` even when `max_seq_len` is much larger. The final server scripts now pass `MAX_NUM_TOKENS` and `MAX_INPUT_LEN` when supported by `trtllm-serve`, and the assignment runner checks the parsed server log before sending benchmark requests.
+
+Before rerunning the assignment benchmark on the real machine, test prompt lengths:
+
+```bash
+TOKENIZER_PATH=/workspace/models/Qwen3-Coder-480B-A35B-Instruct-NVFP4 \
+PROMPT_TOKEN_RESERVE=1024 \
+python3 scripts/test_prompt_lengths.py \
+  --tokenizer-path /workspace/models/Qwen3-Coder-480B-A35B-Instruct-NVFP4 \
+  --contexts "1024 8192 32768"
+```
+
+Then rerun the baseline assignment benchmark:
+
+```bash
+bash scripts/stop_trtllm_server.sh
+
+RESET_RESULTS=1 \
+MODEL_PATH=/workspace/models/Qwen3-Coder-480B-A35B-Instruct-NVFP4 \
+MODEL_NAME=Qwen3-Coder-480B-A35B-Instruct-NVFP4 \
+PLAN_MODEL=/workspace/models/Qwen3-Coder-480B-A35B-Instruct-NVFP4 \
+TOKENIZER_PATH=/workspace/models/Qwen3-Coder-480B-A35B-Instruct-NVFP4 \
+PROMPT_TOKEN_RESERVE=1024 \
+TP_SIZE=4 \
+QUANTIZATION=nvfp4 \
+WAIT_TIMEOUT_S=3600 \
+TIMEOUT_S=1800 \
+CASE_TIMEOUT_S=2400 \
+bash scripts/run_assignment_baseline.sh
+```

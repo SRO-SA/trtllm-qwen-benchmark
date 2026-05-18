@@ -6,8 +6,12 @@ import statistics
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional, Tuple
 
 import requests
+
+_TOKENIZER = None
+_TOKENIZER_PATH = None
 
 
 def gpu_snapshot():
@@ -49,23 +53,101 @@ def mean_gpu_util(snapshot):
     return statistics.mean(vals) if vals else None
 
 
-def make_prompt(context_len):
-    # Approximate token length for smoke/final synthetic code-context tests.
-    # We use ~4 chars/token as a rough estimate. For formal paper-quality numbers,
-    # replace this with tokenizer-based prompt generation.
-    base = "You are a coding assistant. Analyze the following synthetic context and answer briefly.\n\n"
-    repeated = (
-        "def foo(x):\n"
-        "    y = x + 1\n"
-        "    return y\n\n"
+def _get_tokenizer(tokenizer_path: Optional[str]):
+    global _TOKENIZER, _TOKENIZER_PATH
+    if not tokenizer_path:
+        return None
+    if _TOKENIZER is not None and _TOKENIZER_PATH == tokenizer_path:
+        return _TOKENIZER
+    try:
+        from transformers import AutoTokenizer
+
+        _TOKENIZER = AutoTokenizer.from_pretrained(
+            tokenizer_path,
+            trust_remote_code=True,
+            use_fast=True,
+        )
+        _TOKENIZER_PATH = tokenizer_path
+        return _TOKENIZER
+    except Exception as e:
+        print(f"[WARN] Failed to load tokenizer from {tokenizer_path}: {repr(e)}")
+        return None
+
+
+def _encode_len(tokenizer, text: str) -> int:
+    if tokenizer is None:
+        return -1
+    return len(tokenizer.encode(text, add_special_tokens=False))
+
+
+def make_prompt(context_len: int) -> Tuple[str, int, int]:
+    """Create a synthetic code prompt with tokenizer-aware length control.
+
+    context_len is the assignment target window (1k, 8k, 32k, 64k, 128k). We
+    create a prompt that is safely below that target, leaving reserve tokens for
+    chat-template overhead and generated output.
+
+    This is important for TensorRT-LLM: the server validates the *tokenized*
+    prompt against max_num_tokens. Character-based estimates can overshoot badly
+    for Qwen/Qwen3-Coder and caused 32k tests to become 52k+ token prompts.
+    """
+    tokenizer_path = (
+        os.environ.get("TOKENIZER_PATH")
+        or os.environ.get("PLAN_MODEL")
+        or os.environ.get("MODEL_PATH")
     )
-    target_chars = max(1, context_len) * 4
-    body = repeated * max(1, target_chars // len(repeated))
-    return base + body + "\nQuestion: Write one sentence summarizing what the code does."
+    reserve_tokens = int(os.environ.get("PROMPT_TOKEN_RESERVE", "1024"))
+    target_prompt_tokens = max(32, int(context_len) - reserve_tokens)
+
+    header = (
+        "You are a coding assistant. Read the following synthetic Python code context. "
+        "Answer only the final question.\n\n"
+    )
+    unit = (
+        "def transform_value(x):\n"
+        "    y = x + 1\n"
+        "    z = y * 2\n"
+        "    if z % 3 == 0:\n"
+        "        return z - 1\n"
+        "    return z + 1\n\n"
+    )
+    footer = "\nQuestion: In one sentence, summarize what transform_value repeatedly does."
+
+    tokenizer = _get_tokenizer(tokenizer_path)
+
+    if tokenizer is None:
+        # Conservative fallback: use fewer chars/token than before to avoid huge overshoot.
+        target_chars = max(1, target_prompt_tokens) * 2
+        body = unit * max(1, target_chars // len(unit))
+        prompt = header + body + footer
+        return prompt, -1, target_prompt_tokens
+
+    fixed = header + footer
+    fixed_ids = tokenizer.encode(fixed, add_special_tokens=False)
+    unit_ids = tokenizer.encode(unit, add_special_tokens=False)
+    remaining = max(1, target_prompt_tokens - len(fixed_ids))
+
+    # Build exact-ish body in token space, then decode back to text.
+    repeated_ids = []
+    while len(repeated_ids) < remaining:
+        repeated_ids.extend(unit_ids)
+    repeated_ids = repeated_ids[:remaining]
+
+    body = tokenizer.decode(repeated_ids, skip_special_tokens=True)
+    prompt = header + body + footer
+    ids = tokenizer.encode(prompt, add_special_tokens=False)
+
+    # Final trim if decode/re-encode produced a slight overrun.
+    if len(ids) > target_prompt_tokens:
+        ids = ids[:target_prompt_tokens]
+        prompt = tokenizer.decode(ids, skip_special_tokens=True)
+        ids = tokenizer.encode(prompt, add_special_tokens=False)
+
+    return prompt, len(ids), target_prompt_tokens
 
 
 def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s):
-    prompt = make_prompt(context_len)
+    prompt, prompt_tokens_est, target_prompt_tokens = make_prompt(context_len)
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
@@ -80,6 +162,7 @@ def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s):
     end = None
     output_text = ""
     completion_tokens = None
+    prompt_tokens_reported = None
     error = None
     status_code = None
 
@@ -107,6 +190,7 @@ def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s):
 
                 if "usage" in obj and obj["usage"]:
                     completion_tokens = obj["usage"].get("completion_tokens", completion_tokens)
+                    prompt_tokens_reported = obj["usage"].get("prompt_tokens", prompt_tokens_reported)
 
                 choices = obj.get("choices", [])
                 if choices:
@@ -131,9 +215,9 @@ def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s):
 
     # If server does not return usage in streaming mode, use a rough fallback.
     if completion_tokens is None:
-        completion_tokens = max(1, len(output_text.split()))
+        completion_tokens = max(1, len(output_text.split())) if output_text else 0
 
-    tps = completion_tokens / total_time_s
+    tps = completion_tokens / total_time_s if total_time_s > 0 else 0.0
 
     return {
         "request_id": request_id,
@@ -143,6 +227,9 @@ def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s):
         "ttft_ms": ttft_ms,
         "total_time_s": total_time_s,
         "completion_tokens": completion_tokens,
+        "prompt_tokens_est": prompt_tokens_est,
+        "target_prompt_tokens": target_prompt_tokens,
+        "prompt_tokens_reported": prompt_tokens_reported,
         "tps": tps,
         "output_chars": len(output_text),
     }
@@ -211,6 +298,10 @@ def main():
     total_time_s = max(end_wall - start_wall, 1e-9)
     aggregate_tps = total_output_tokens / total_time_s
 
+    prompt_est_values = [r.get("prompt_tokens_est") for r in results if r.get("prompt_tokens_est") not in (None, -1)]
+    prompt_reported_values = [r.get("prompt_tokens_reported") for r in results if r.get("prompt_tokens_reported") is not None]
+    target_prompt_values = [r.get("target_prompt_tokens") for r in results if r.get("target_prompt_tokens") is not None]
+
     row = {
         "framework": args.framework,
         "model": args.model,
@@ -221,6 +312,9 @@ def main():
         "context_len": args.context_len,
         "concurrency": args.concurrency,
         "max_new_tokens": args.max_tokens,
+        "target_prompt_tokens": max(target_prompt_values) if target_prompt_values else "",
+        "prompt_tokens_est": max(prompt_est_values) if prompt_est_values else "",
+        "prompt_tokens_reported": max(prompt_reported_values) if prompt_reported_values else "",
         "num_requests": args.num_requests,
         "successful_requests": len(successes),
         "failed_requests": len(failures),

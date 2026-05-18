@@ -10,6 +10,11 @@ Safety checks:
   1. Sequence safety:
        context_len + max_new_tokens + safety_tokens <= server_max_seq_len
 
+  1b. Request-token safety:
+       context_len + max_new_tokens + safety_tokens <= server_max_num_tokens
+       This matters for TensorRT-LLM PyTorch backend because max_seq_len can be
+       large while max_num_tokens remains at a smaller default (for example 8192).
+
   2. Approximate KV-cache safety:
        estimated_kv_gb <= min_free_gpu_gb * kv_memory_fraction
 
@@ -131,6 +136,7 @@ def build_plan(args):
     for context in contexts:
         estimated_total_tokens = context + args.max_new_tokens + args.safety_tokens
         seq_safe = estimated_total_tokens <= args.server_max_seq_len
+        num_tokens_safe = estimated_total_tokens <= args.server_max_num_tokens
 
         for conc in concurrencies:
             estimated_kv_gb = None
@@ -149,11 +155,16 @@ def build_plan(args):
                     f"usable_kv_gb={usable_kv_gb:.4f}"
                 )
 
-            run = bool(seq_safe and memory_safe)
+            run = bool(seq_safe and num_tokens_safe and memory_safe)
             if not seq_safe:
                 reason = (
                     f"total_tokens={estimated_total_tokens} > "
                     f"server_max_seq_len={args.server_max_seq_len}"
+                )
+            elif not num_tokens_safe:
+                reason = (
+                    f"total_tokens={estimated_total_tokens} > "
+                    f"server_max_num_tokens={args.server_max_num_tokens}"
                 )
             elif not memory_safe:
                 reason = memory_reason
@@ -168,7 +179,9 @@ def build_plan(args):
                     "safety_tokens": args.safety_tokens,
                     "estimated_total_tokens": estimated_total_tokens,
                     "server_max_seq_len": args.server_max_seq_len,
+                    "server_max_num_tokens": args.server_max_num_tokens,
                     "seq_safe": seq_safe,
+                    "num_tokens_safe": num_tokens_safe,
                     "estimated_kv_gb": None
                     if estimated_kv_gb is None
                     else round(estimated_kv_gb, 4),
@@ -192,6 +205,7 @@ def build_plan(args):
         "kv_memory_fraction": args.kv_memory_fraction,
         "usable_kv_gb": usable_kv_gb,
         "server_max_seq_len": args.server_max_seq_len,
+        "server_max_num_tokens": args.server_max_num_tokens,
         "max_new_tokens": args.max_new_tokens,
         "safety_tokens": args.safety_tokens,
         "tests": tests,
@@ -203,6 +217,7 @@ def main():
     parser.add_argument("--model", required=True, help="HF model id or local model path")
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--server-max-seq-len", type=int, default=512)
+    parser.add_argument("--server-max-num-tokens", type=int, default=None, help="TensorRT-LLM max_num_tokens; defaults to server-max-seq-len")
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--kv-dtype", default="bf16", choices=["bf16", "fp16", "fp8", "int8"])
     parser.add_argument("--safety-tokens", type=int, default=64)
@@ -217,6 +232,8 @@ def main():
         help="json prints full plan; tsv prints runnable context/concurrency rows; summary prints human-readable plan.",
     )
     args = parser.parse_args()
+    if args.server_max_num_tokens is None:
+        args.server_max_num_tokens = args.server_max_seq_len
 
     plan = build_plan(args)
 
@@ -244,6 +261,7 @@ def main():
             )
         print(f"Model for planning: {plan['model']}")
         print(f"Server max seq len: {plan['server_max_seq_len']}")
+        print(f"Server max num tokens: {plan['server_max_num_tokens']}")
         print(f"Max new tokens: {plan['max_new_tokens']}")
         print(f"Safety tokens: {plan['safety_tokens']}")
         print()

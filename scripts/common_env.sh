@@ -75,3 +75,21 @@ except Exception as e:
     raise
 PY
 }
+
+trtllm_supports_option() {
+  local opt="$1"
+  trtllm-serve serve --help 2>/dev/null | grep -q -- "$opt"
+}
+
+append_trtllm_option_if_supported() {
+  local array_name="$1"
+  local opt="$2"
+  local value="$3"
+  # shellcheck disable=SC2178,SC2128
+  local -n arr="$array_name"
+  if trtllm_supports_option "$opt"; then
+    arr+=("$opt" "$value")
+  else
+    echo "WARNING: trtllm-serve does not advertise option $opt; not passing it."
+  fi
+}

@@ -4,19 +4,18 @@ set -euo pipefail
 source "$(dirname "$0")/common_env.sh"
 
 # Assignment-specific runner for TensorRT-LLM + Qwen3-Coder-480B NVFP4.
-# It explicitly covers the required assignment scenarios:
+# Required assignment scenarios:
 #   - Short prompts up to 1k
 #   - Medium prompts up to 8k
 #   - Long-context evaluation at 32k, 64k, 128k
 #   - Multi-user / concurrent workloads
 #   - Sustained throughput style runs via configurable NUM_REQUESTS
 #
-# This runner is intentionally watchdog-oriented:
-#   - starts a fresh server for each context group
-#   - waits for /health with timeout
-#   - wraps each benchmark case with a wall-clock timeout
-#   - appends failure rows to the CSV when a server/case fails
-#   - saves logs, metrics, and diagnostics for failure analysis
+# Important fixes based on real 480B logs:
+#   1. Prompt generation must be tokenizer-aware; character estimates overshot 32k
+#      to 52k+ tokens.
+#   2. TensorRT-LLM PyTorch backend has max_num_tokens separate from max_seq_len.
+#      max_seq_len=65536 with max_num_tokens=8192 rejects 32k+ prompts.
 
 MODEL_PATH="${MODEL_PATH:-$FINAL_MODEL_PATH}"
 MODEL_NAME="${MODEL_NAME:-Qwen3-Coder-480B-A35B-Instruct-NVFP4}"
@@ -26,9 +25,10 @@ QUANTIZATION="${QUANTIZATION:-nvfp4}"
 DECODE_MODE="${DECODE_MODE:-baseline}"
 OUT="${OUT:-results/assignment_tensorrt_llm_qwen480b_baseline.csv}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-256}"
-SAFETY_TOKENS="${SAFETY_TOKENS:-512}"
+SAFETY_TOKENS="${SAFETY_TOKENS:-1024}"
+PROMPT_TOKEN_RESERVE="${PROMPT_TOKEN_RESERVE:-$SAFETY_TOKENS}"
 NUM_REQUESTS="${NUM_REQUESTS:-8}"
-KV_DTYPE="${KV_DTYPE:-bf16}"
+KV_DTYPE="${KV_DTYPE:-fp8}"
 KV_MEMORY_FRACTION="${KV_MEMORY_FRACTION:-0.70}"
 TIMEOUT_S="${TIMEOUT_S:-1800}"
 CASE_TIMEOUT_S="${CASE_TIMEOUT_S:-$((TIMEOUT_S + 300))}"
@@ -66,17 +66,27 @@ append_stage_failure_rows() {
 run_stage() {
   local STAGE_NAME="$1"
   local SERVER_SEQ_LEN="$2"
-  local CONTEXTS="$3"
-  local CONCURRENCIES="$4"
+  local SERVER_NUM_TOKENS="$3"
+  local CONTEXTS="$4"
+  local CONCURRENCIES="$5"
   local STAGE_OUT_PLAN="results/plan_assignment_${STAGE_NAME}.json"
   local STAGE_LOG="${LOG_DIR}/server_${STAGE_NAME}.log"
   local STAGE_METRICS="${METRICS_DIR}/metrics_${STAGE_NAME}.json"
   local STAGE_STATUS=0
 
+  # Required per-request token limit for the largest prompt in this stage.
+  local MAX_CONTEXT=0
+  for C in $CONTEXTS; do
+    if (( C > MAX_CONTEXT )); then MAX_CONTEXT=$C; fi
+  done
+  local REQUIRED_TOTAL_TOKENS=$((MAX_CONTEXT + MAX_NEW_TOKENS + SAFETY_TOKENS))
+
   echo "============================================================"
   echo "Assignment stage: ${STAGE_NAME}"
   echo "Model path: ${MODEL_PATH}"
   echo "Server max seq len: ${SERVER_SEQ_LEN}"
+  echo "Server max num tokens: ${SERVER_NUM_TOKENS}"
+  echo "Required total tokens: ${REQUIRED_TOTAL_TOKENS}"
   echo "Contexts: ${CONTEXTS}"
   echo "Concurrencies: ${CONCURRENCIES}"
   echo "Output: ${OUT}"
@@ -86,6 +96,8 @@ run_stage() {
   bash scripts/stop_trtllm_server.sh || true
 
   MAX_SEQ_LEN="$SERVER_SEQ_LEN" \
+  MAX_NUM_TOKENS="$SERVER_NUM_TOKENS" \
+  MAX_INPUT_LEN="$SERVER_SEQ_LEN" \
   TP_SIZE="$TP_SIZE" \
   MODEL_PATH="$MODEL_PATH" \
   CONFIG_PATH="$CONFIG_PATH" \
@@ -103,17 +115,32 @@ run_stage() {
     return 0
   fi
 
+  if ! "$PYTHON_BIN" scripts/check_server_limits.py \
+      --log "$STAGE_LOG" \
+      --required-seq-len "$REQUIRED_TOTAL_TOKENS" \
+      --required-num-tokens "$REQUIRED_TOTAL_TOKENS"; then
+    echo "WARNING: Stage ${STAGE_NAME} server limits are insufficient. Recording failure rows and continuing."
+    SERVER_LOG="$STAGE_LOG" bash scripts/diagnose_server.sh || true
+    append_stage_failure_rows "$CONTEXTS" "$CONCURRENCIES" "server_limits_insufficient_required_${REQUIRED_TOTAL_TOKENS}"
+    bash scripts/stop_trtllm_server.sh || true
+    echo "Completed failed stage ${STAGE_NAME}."
+    return 0
+  fi
+
   curl --max-time 10 --connect-timeout 2 -sS "http://localhost:${PORT}/v1/models" \
     > "${METRICS_DIR}/models_${STAGE_NAME}.json" || true
 
   MODEL_NAME="$MODEL_NAME" \
   PLAN_MODEL="$MODEL_PATH" \
+  TOKENIZER_PATH="$MODEL_PATH" \
+  PROMPT_TOKEN_RESERVE="$PROMPT_TOKEN_RESERVE" \
   DECODE_MODE="$DECODE_MODE" \
   QUANTIZATION="$QUANTIZATION" \
   OUT="$OUT" \
   CONTEXTS="$CONTEXTS" \
   CONCURRENCIES="$CONCURRENCIES" \
   SERVER_MAX_SEQ_LEN="$SERVER_SEQ_LEN" \
+  SERVER_MAX_NUM_TOKENS="$SERVER_NUM_TOKENS" \
   MAX_NEW_TOKENS="$MAX_NEW_TOKENS" \
   NUM_REQUESTS="$NUM_REQUESTS" \
   SAFETY_TOKENS="$SAFETY_TOKENS" \
@@ -140,14 +167,15 @@ run_stage() {
   echo "Completed stage ${STAGE_NAME}."
 }
 
-# Required assignment contexts and scenarios.
-# Server seq length is intentionally larger than context + MAX_NEW_TOKENS + SAFETY_TOKENS.
+# Required assignment contexts and scenarios. Server seq length is intentionally
+# larger than context + MAX_NEW_TOKENS + SAFETY_TOKENS. max_num_tokens is set
+# separately because TensorRT-LLM 1.1.0 otherwise defaults it to 8192.
 
-run_stage "short_1k_multiuser" 2048 "1024" "1 2 4 8"
-run_stage "medium_8k_multiuser" 16384 "8192" "1 2 4"
-run_stage "long_32k" 65536 "32768" "1 2"
-run_stage "long_64k" 131072 "65536" "1"
-run_stage "long_128k" 262144 "131072" "1"
+run_stage "short_1k_multiuser" 4096 16384 "1024" "1 2 4 8"
+run_stage "medium_8k_multiuser" 16384 65536 "8192" "1 2 4"
+run_stage "long_32k" 65536 131072 "32768" "1 2"
+run_stage "long_64k" 131072 196608 "65536" "1"
+run_stage "long_128k" 262144 262144 "131072" "1"
 
 echo "============================================================"
 echo "Assignment baseline benchmark complete."

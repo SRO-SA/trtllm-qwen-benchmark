@@ -12,35 +12,46 @@ OUT="${OUT:-results/benchmark_${DECODE_MODE}.csv}"
 CONTEXTS="${CONTEXTS:-128 256}"
 CONCURRENCIES="${CONCURRENCIES:-1}"
 SERVER_MAX_SEQ_LEN="${SERVER_MAX_SEQ_LEN:-$MAX_SEQ_LEN}"
+# TensorRT-LLM PyTorch backend has a separate max_num_tokens limit. If not
+# raised, it may stay at 8192 even when max_seq_len is 65536+.
+SERVER_MAX_NUM_TOKENS="${SERVER_MAX_NUM_TOKENS:-$SERVER_MAX_SEQ_LEN}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-64}"
 NUM_REQUESTS="${NUM_REQUESTS:-8}"
 SAFETY_TOKENS="${SAFETY_TOKENS:-64}"
+PROMPT_TOKEN_RESERVE="${PROMPT_TOKEN_RESERVE:-$SAFETY_TOKENS}"
 TP_SIZE="${TP_SIZE:-1}"
 KV_DTYPE="${KV_DTYPE:-bf16}"
 KV_MEMORY_FRACTION="${KV_MEMORY_FRACTION:-0.20}"
 TIMEOUT_S="${TIMEOUT_S:-300}"
-# Hard wall-clock timeout per benchmark case. This catches cases where the client/server wedges despite per-request timeouts.
 CASE_TIMEOUT_S="${CASE_TIMEOUT_S:-$((TIMEOUT_S + 120))}"
-# If a case times out/fails, append a failure row and exit nonzero so assignment stages can record the failure reason.
 STOP_ON_CASE_FAILURE="${STOP_ON_CASE_FAILURE:-1}"
 SERVER_LOG="${SERVER_LOG:-}"
 PLAN_OUT="${PLAN_OUT:-results/plan_${DECODE_MODE}.json}"
+TOKENIZER_PATH="${TOKENIZER_PATH:-$PLAN_MODEL}"
 
 mkdir -p results
+
+export TOKENIZER_PATH
+export PLAN_MODEL
+export MODEL_PATH="${MODEL_PATH:-$PLAN_MODEL}"
+export PROMPT_TOKEN_RESERVE
 
 echo "======================================"
 echo "TensorRT-LLM benchmark grid"
 echo "======================================"
 echo "MODEL_NAME=${MODEL_NAME}"
 echo "PLAN_MODEL=${PLAN_MODEL}"
+echo "TOKENIZER_PATH=${TOKENIZER_PATH}"
 echo "DECODE_MODE=${DECODE_MODE}"
 echo "QUANTIZATION=${QUANTIZATION}"
 echo "CONTEXTS=${CONTEXTS}"
 echo "CONCURRENCIES=${CONCURRENCIES}"
 echo "SERVER_MAX_SEQ_LEN=${SERVER_MAX_SEQ_LEN}"
+echo "SERVER_MAX_NUM_TOKENS=${SERVER_MAX_NUM_TOKENS}"
 echo "MAX_NEW_TOKENS=${MAX_NEW_TOKENS}"
 echo "NUM_REQUESTS=${NUM_REQUESTS}"
 echo "SAFETY_TOKENS=${SAFETY_TOKENS}"
+echo "PROMPT_TOKEN_RESERVE=${PROMPT_TOKEN_RESERVE}"
 echo "TP_SIZE=${TP_SIZE}"
 echo "KV_DTYPE=${KV_DTYPE}"
 echo "KV_MEMORY_FRACTION=${KV_MEMORY_FRACTION}"
@@ -57,6 +68,7 @@ echo "Planning safe cases..."
   --model "$PLAN_MODEL" \
   --tp-size "$TP_SIZE" \
   --server-max-seq-len "$SERVER_MAX_SEQ_LEN" \
+  --server-max-num-tokens "$SERVER_MAX_NUM_TOKENS" \
   --max-new-tokens "$MAX_NEW_TOKENS" \
   --kv-dtype "$KV_DTYPE" \
   --safety-tokens "$SAFETY_TOKENS" \
@@ -105,7 +117,16 @@ while IFS=$'\t' read -r CONTEXT CONCURRENCY EST_TOTAL EST_KV; do
     fi
     echo "ERROR: ${REASON} for context=${CONTEXT}, concurrency=${CONCURRENCY}"
     SERVER_LOG="$SERVER_LOG" bash scripts/diagnose_server.sh || true
-    "$PYTHON_BIN" scripts/append_failure_row.py       --output "$OUT"       --model "$MODEL_NAME"       --quantization "$QUANTIZATION"       --decode-mode "$DECODE_MODE"       --context-len "$CONTEXT"       --concurrency "$CONCURRENCY"       --max-tokens "$MAX_NEW_TOKENS"       --num-requests "$NUM_REQUESTS"       --error-message "$REASON"
+    "$PYTHON_BIN" scripts/append_failure_row.py \
+      --output "$OUT" \
+      --model "$MODEL_NAME" \
+      --quantization "$QUANTIZATION" \
+      --decode-mode "$DECODE_MODE" \
+      --context-len "$CONTEXT" \
+      --concurrency "$CONCURRENCY" \
+      --max-tokens "$MAX_NEW_TOKENS" \
+      --num-requests "$NUM_REQUESTS" \
+      --error-message "$REASON"
 
     if [[ "$STOP_ON_CASE_FAILURE" == "1" ]]; then
       exit "$CASE_STATUS"
@@ -115,6 +136,7 @@ done < <("$PYTHON_BIN" benchmark/plan_safe_tests.py \
   --model "$PLAN_MODEL" \
   --tp-size "$TP_SIZE" \
   --server-max-seq-len "$SERVER_MAX_SEQ_LEN" \
+  --server-max-num-tokens "$SERVER_MAX_NUM_TOKENS" \
   --max-new-tokens "$MAX_NEW_TOKENS" \
   --kv-dtype "$KV_DTYPE" \
   --safety-tokens "$SAFETY_TOKENS" \
@@ -124,7 +146,7 @@ done < <("$PYTHON_BIN" benchmark/plan_safe_tests.py \
   --format tsv)
 
 if (( RUN_COUNT == 0 )); then
-  echo "No safe benchmark cases were selected. Increase SERVER_MAX_SEQ_LEN or reduce MAX_NEW_TOKENS/CONTEXTS."
+  echo "No safe benchmark cases were selected. Increase SERVER_MAX_SEQ_LEN/SERVER_MAX_NUM_TOKENS or reduce MAX_NEW_TOKENS/CONTEXTS."
   exit 1
 fi
 
