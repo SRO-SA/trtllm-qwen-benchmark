@@ -407,3 +407,35 @@ results/assignment_summary.csv
 results/server_logs/
 results/metrics/
 ```
+
+## Stuck/Timeout Detection
+
+The assignment runner includes watchdog-style checks because long-context TensorRT-LLM runs can fail in several ways: the server may never become healthy, a benchmark request may hang, or port 8000 may remain occupied by an old server.
+
+Key scripts:
+
+- `scripts/wait_for_server.sh`: waits for `/health` with a timeout. If the server process exits early or the timeout is reached, it prints diagnostics and the tail of the server log.
+- `scripts/run_benchmark_grid.sh`: wraps each benchmark case with a wall-clock timeout (`CASE_TIMEOUT_S`). If a case times out, it appends a failure row to the CSV instead of silently hanging forever.
+- `scripts/diagnose_server.sh`: collects `nvidia-smi`, relevant processes, port bind status, health/model/metrics endpoint checks, and the last server log lines.
+- `scripts/stop_trtllm_server.sh`: kills old TensorRT-LLM processes and verifies that port 8000 is free using Python, so it does not require `lsof` or `ss`.
+
+Useful knobs:
+
+```bash
+WAIT_TIMEOUT_S=3600      # max time to wait for model/server loading
+TIMEOUT_S=1800           # request timeout inside benchmark client
+CASE_TIMEOUT_S=2100      # wall-clock timeout for a whole benchmark case
+RESET_RESULTS=1          # remove old assignment CSV before starting
+```
+
+Example:
+
+```bash
+RESET_RESULTS=1 \
+WAIT_TIMEOUT_S=3600 \
+TIMEOUT_S=1800 \
+CASE_TIMEOUT_S=2400 \
+bash scripts/run_assignment_baseline.sh
+```
+
+If a required 64k or 128k assignment case fails, the CSV will contain a `runtime_stability=fail` row and `error_messages` will record the failure reason such as `case_timeout_after_2400s`. The corresponding logs and diagnostic files are saved under `results/server_logs/`, `results/metrics/`, and `results/diagnostics/`.

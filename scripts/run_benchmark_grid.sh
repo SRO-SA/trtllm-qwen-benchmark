@@ -19,6 +19,11 @@ TP_SIZE="${TP_SIZE:-1}"
 KV_DTYPE="${KV_DTYPE:-bf16}"
 KV_MEMORY_FRACTION="${KV_MEMORY_FRACTION:-0.20}"
 TIMEOUT_S="${TIMEOUT_S:-300}"
+# Hard wall-clock timeout per benchmark case. This catches cases where the client/server wedges despite per-request timeouts.
+CASE_TIMEOUT_S="${CASE_TIMEOUT_S:-$((TIMEOUT_S + 120))}"
+# If a case times out/fails, append a failure row and exit nonzero so assignment stages can record the failure reason.
+STOP_ON_CASE_FAILURE="${STOP_ON_CASE_FAILURE:-1}"
+SERVER_LOG="${SERVER_LOG:-}"
 PLAN_OUT="${PLAN_OUT:-results/plan_${DECODE_MODE}.json}"
 
 mkdir -p results
@@ -40,6 +45,9 @@ echo "TP_SIZE=${TP_SIZE}"
 echo "KV_DTYPE=${KV_DTYPE}"
 echo "KV_MEMORY_FRACTION=${KV_MEMORY_FRACTION}"
 echo "TIMEOUT_S=${TIMEOUT_S}"
+echo "CASE_TIMEOUT_S=${CASE_TIMEOUT_S}"
+echo "STOP_ON_CASE_FAILURE=${STOP_ON_CASE_FAILURE}"
+echo "SERVER_LOG=${SERVER_LOG}"
 echo "OUT=${OUT}"
 echo "PLAN_OUT=${PLAN_OUT}"
 echo "======================================"
@@ -66,19 +74,43 @@ while IFS=$'\t' read -r CONTEXT CONCURRENCY EST_TOTAL EST_KV; do
   RUN_COUNT=$((RUN_COUNT + 1))
   echo "Running case #${RUN_COUNT}: context=${CONTEXT}, concurrency=${CONCURRENCY}, estimated_total_tokens=${EST_TOTAL}, estimated_kv_gb=${EST_KV}"
 
-  "$PYTHON_BIN" benchmark/benchmark_openai_stream.py \
-    --host localhost \
-    --port "$PORT" \
-    --model "$MODEL_NAME" \
-    --framework tensorrt-llm \
-    --quantization "$QUANTIZATION" \
-    --decode-mode "$DECODE_MODE" \
-    --context-len "$CONTEXT" \
-    --concurrency "$CONCURRENCY" \
-    --num-requests "$NUM_REQUESTS" \
-    --max-tokens "$MAX_NEW_TOKENS" \
-    --timeout-s "$TIMEOUT_S" \
+  CASE_CMD=(
+    "$PYTHON_BIN" benchmark/benchmark_openai_stream.py
+    --host localhost
+    --port "$PORT"
+    --model "$MODEL_NAME"
+    --framework tensorrt-llm
+    --quantization "$QUANTIZATION"
+    --decode-mode "$DECODE_MODE"
+    --context-len "$CONTEXT"
+    --concurrency "$CONCURRENCY"
+    --num-requests "$NUM_REQUESTS"
+    --max-tokens "$MAX_NEW_TOKENS"
+    --timeout-s "$TIMEOUT_S"
     --output "$OUT"
+  )
+
+  CASE_STATUS=0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --preserve-status "$CASE_TIMEOUT_S" "${CASE_CMD[@]}" || CASE_STATUS=$?
+  else
+    "${CASE_CMD[@]}" || CASE_STATUS=$?
+  fi
+
+  if [[ "$CASE_STATUS" != "0" ]]; then
+    if [[ "$CASE_STATUS" == "124" || "$CASE_STATUS" == "143" ]]; then
+      REASON="case_timeout_after_${CASE_TIMEOUT_S}s"
+    else
+      REASON="benchmark_case_failed_exit_${CASE_STATUS}"
+    fi
+    echo "ERROR: ${REASON} for context=${CONTEXT}, concurrency=${CONCURRENCY}"
+    SERVER_LOG="$SERVER_LOG" bash scripts/diagnose_server.sh || true
+    "$PYTHON_BIN" scripts/append_failure_row.py       --output "$OUT"       --model "$MODEL_NAME"       --quantization "$QUANTIZATION"       --decode-mode "$DECODE_MODE"       --context-len "$CONTEXT"       --concurrency "$CONCURRENCY"       --max-tokens "$MAX_NEW_TOKENS"       --num-requests "$NUM_REQUESTS"       --error-message "$REASON"
+
+    if [[ "$STOP_ON_CASE_FAILURE" == "1" ]]; then
+      exit "$CASE_STATUS"
+    fi
+  fi
 done < <("$PYTHON_BIN" benchmark/plan_safe_tests.py \
   --model "$PLAN_MODEL" \
   --tp-size "$TP_SIZE" \
