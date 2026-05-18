@@ -11,6 +11,7 @@ MAX_SEQ_LEN="${MAX_SEQ_LEN:-32768}"
 # max_seq_len is large.
 MAX_NUM_TOKENS="${MAX_NUM_TOKENS:-$MAX_SEQ_LEN}"
 MAX_INPUT_LEN="${MAX_INPUT_LEN:-$MAX_SEQ_LEN}"
+MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-}"
 CONFIG_PATH="${CONFIG_PATH:-configs/final_baseline_qwen480b.yaml}"
 
 EXTRA_ARGS=(
@@ -23,6 +24,14 @@ EXTRA_ARGS=(
 
 append_trtllm_option_if_supported EXTRA_ARGS --max_num_tokens "$MAX_NUM_TOKENS"
 append_trtllm_option_if_supported EXTRA_ARGS --max_input_len "$MAX_INPUT_LEN"
+
+# Some TensorRT-LLM versions expose max_batch_size as a CLI flag; others only
+# accept it through --extra_llm_api_options. We try the CLI flag only when it is
+# advertised and also include it in generated stage configs when used by the
+# assignment runner.
+if [[ -n "$MAX_BATCH_SIZE" ]]; then
+  append_trtllm_option_if_supported EXTRA_ARGS --max_batch_size "$MAX_BATCH_SIZE"
+fi
 
 # TensorRT-LLM 1.1.0 supports --extra_llm_api_options. Newer versions may also support --config.
 if trtllm_supports_option --extra_llm_api_options; then
@@ -39,6 +48,7 @@ echo "TP size: $TP_SIZE"
 echo "Max seq len: $MAX_SEQ_LEN"
 echo "Max num tokens: $MAX_NUM_TOKENS"
 echo "Max input len: $MAX_INPUT_LEN"
+echo "Max batch size: ${MAX_BATCH_SIZE:-<container default>}"
 echo "Config: $CONFIG_PATH"
 echo "Extra args: ${EXTRA_ARGS[*]}"
 
