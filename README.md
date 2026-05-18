@@ -1,279 +1,254 @@
 # TensorRT-LLM Qwen Benchmark
 
-This repository contains scripts for testing and benchmarking TensorRT-LLM for the Qwen3-Coder-480B 4-bit inference task.
+This repository contains scripts for testing and benchmarking TensorRT-LLM for Qwen3-Coder-480B 4-bit inference.
 
-The final goal is to run TensorRT-LLM on a 4× RTX PRO 6000 Blackwell machine and collect system metrics for different context lengths and concurrency levels.
+The target assignment setup is:
 
-## Assignment Target
-
-Framework:
-
-- TensorRT-LLM
-
-Model:
-
-- Qwen3-Coder-480B
-- 4-bit offline/pre-made quantization, likely AWQ
-
-Target GPU:
-
-- 4× RTX PRO 6000 Blackwell
-
-Context windows:
-
-- 1k
-- 8k
-- 32k
-- 64k
-- 128k
-
-Required metrics:
-
-- TTFT
-- TPS mean
-- TPS P99
-- Max concurrency
-- VRAM idle/load
-- KV-cache growth
-- Runtime stability
-- GPU utilization
-- Throughput degradation under concurrency
-- Multi-user scalability limits
-- Latency/throughput tradeoff
-
-## Current Status
-
-A smoke test was completed on a cheaper Vast.ai instance before moving to the final 4-GPU setup.
-
-Smoke-test setup:
-
-- GPU: 1× NVIDIA RTX 6000 Ada Generation
 - Framework: TensorRT-LLM
-- TensorRT-LLM version: 1.1.0
-- Backend: PyTorch backend
-- Test model: `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
+- Main model: Qwen3-Coder-480B
+- Quantization: 4-bit offline/pre-made quantization
+- Practical TensorRT-LLM checkpoint: `nvidia/Qwen3-Coder-480B-A35B-Instruct-NVFP4`
+- Target GPU: 4× RTX PRO 6000 Blackwell
+- Context windows: 1k, 8k, 32k, 64k, 128k
+- Metrics: TTFT, TPS mean/P99, aggregate TPS, max concurrency, VRAM idle/load, KV-cache growth, GPU utilization, runtime stability
 
-The smoke test verified:
+## Important Environment Rule
 
-- TensorRT-LLM installation
-- `trtllm-serve` availability
-- CUDA/GPU visibility
-- OpenAI-compatible API
-- `/health`
-- `/v1/models`
-- `/v1/chat/completions`
-- `/metrics`
-- Benchmark CSV generation
+Do **not** run unconstrained package upgrades inside the TensorRT-LLM container.
 
-## Repository Structure
+Avoid:
 
-```text
-trtllm-qwen-benchmark/
-├── scripts/
-│   ├── setup_check.sh
-│   ├── serve_small.sh
-│   ├── test_request.sh
-│   ├── run_smoke_benchmark.sh
-│   └── setup_github_ssh.sh
-├── benchmark/
-│   └── benchmark_openai_stream.py
-├── results/
-│   └── smoke_results.csv
-└── README.md
+```bash
+pip install -U ...
 ```
 
-## Scripts
+TensorRT-LLM 1.1.0 requires `numpy < 2`, and the included Transformers stack requires `huggingface_hub < 1.0`.
 
-### `scripts/setup_check.sh`
-
-Checks whether the environment is ready.
-
-It verifies:
-
-- GPU visibility with `nvidia-smi`
-- Python version
-- `trtllm-serve` availability
-- PyTorch CUDA access
-- TensorRT-LLM Python import
-- Required helper packages such as `requests`, `pandas`, `numpy`, and `tqdm`
-
-Run:
+Use:
 
 ```bash
 bash scripts/setup_check.sh
 ```
 
-Expected successful signs:
+This repairs/install safe dependency versions through `scripts/common_env.sh`.
+
+## Repository Structure
+
+```text
+trtllm-qwen-benchmark/
+├── benchmark/
+│   └── benchmark_openai_stream.py
+├── configs/
+│   ├── final_baseline_qwen480b.yaml
+│   ├── final_draft_target_qwen480b.yaml
+│   └── spec_draft_target_qwen_small.yaml
+├── scripts/
+│   ├── common_env.sh
+│   ├── setup_check.sh
+│   ├── download_qwen_small_models.sh
+│   ├── download_final_model.sh
+│   ├── serve_small.sh
+│   ├── serve_qwen_small_baseline.sh
+│   ├── serve_qwen_small_draft_target.sh
+│   ├── serve_final_baseline.sh
+│   ├── serve_final_draft_target.sh
+│   ├── run_smoke_benchmark.sh
+│   ├── run_spec_smoke_benchmark.sh
+│   ├── run_final_baseline_benchmark.sh
+│   ├── run_final_draft_target_benchmark.sh
+│   ├── compare_spec_results.sh
+│   ├── setup_github_ssh.sh
+│   └── test_request.sh
+└── results/
+```
+
+## 1. Basic Environment Check
+
+```bash
+bash scripts/setup_check.sh
+```
+
+Expected signs:
 
 ```text
 trtllm-serve found
 CUDA available: True
 TensorRT-LLM import: OK
+numpy: 1.26.x
+huggingface_hub: 0.x
 ```
 
----
+## 2. TinyLlama Smoke Test
 
-### `scripts/serve_small.sh`
-
-Starts a small TensorRT-LLM test server using TinyLlama.
-
-Default model:
-
-```text
-TinyLlama/TinyLlama-1.1B-Chat-v1.0
-```
-
-Run in foreground:
-
-```bash
-bash scripts/serve_small.sh
-```
-
-Run in background:
+Start server in background:
 
 ```bash
 nohup bash scripts/serve_small.sh > server.log 2>&1 &
 echo $! > server.pid
-```
-
-Check server log:
-
-```bash
 tail -f server.log
 ```
 
-Stop watching the log with:
+Stop watching log with `Ctrl+C`.
 
-```text
-Ctrl + C
-```
-
-This only stops `tail`, not the server.
-
-Stop the server:
+Check health:
 
 ```bash
-kill $(cat server.pid)
+curl -i http://localhost:8000/health
+curl http://localhost:8000/v1/models
 ```
 
-If needed:
-
-```bash
-pkill -f trtllm-serve
-```
-
----
-
-### `scripts/test_request.sh`
-
-Sends one test request to the running TensorRT-LLM server.
-
-Run:
-
-```bash
-bash scripts/test_request.sh
-```
-
-This checks whether the OpenAI-compatible `/v1/chat/completions` endpoint works.
-
----
-
-### `scripts/run_smoke_benchmark.sh`
-
-Runs a small benchmark against the local TensorRT-LLM server.
-
-Current smoke-test settings:
-
-- model: TinyLlama
-- context length: small test contexts
-- concurrency: 1, 2, 4
-- output: `results/smoke_results.csv`
-
-Run:
+Run benchmark:
 
 ```bash
 bash scripts/run_smoke_benchmark.sh
 ```
 
-View results:
+Stop server:
 
 ```bash
-cat results/smoke_results.csv
+kill $(cat server.pid)
+# or
+pkill -f trtllm-serve
 ```
 
-The CSV includes:
+## 3. Small DraftTarget Compatibility Test
 
-- framework
-- model
-- quantization
-- GPU type
-- number of GPUs
-- context length
-- concurrency
-- max new tokens
-- number of requests
-- successful requests
-- failed requests
-- TTFT mean/P50/P99
-- TPS mean/P50/P99
-- total output tokens
-- total runtime
-- VRAM idle/load
-- approximate KV-cache growth
-- GPU utilization
-- runtime stability
-- error count
-- error messages
+This verifies TensorRT-LLM DraftTarget speculative decoding before using the huge model.
 
----
-
-### `benchmark/benchmark_openai_stream.py`
-
-Main benchmark script.
-
-It sends requests to an OpenAI-compatible server and measures:
-
-- time to first token
-- total request time
-- generated tokens per second
-- successful/failed requests
-- GPU memory before and after benchmark
-- approximate KV-cache growth
-- runtime stability
-
-Example direct usage:
+Download small local models:
 
 ```bash
-python3 benchmark/benchmark_openai_stream.py \
-  --host localhost \
-  --port 8000 \
-  --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
-  --framework tensorrt-llm \
-  --quantization smoke-test \
-  --context-len 1024 \
-  --concurrency 1 \
-  --num-requests 8 \
-  --max-tokens 64 \
-  --output results/smoke_results.csv
+bash scripts/download_qwen_small_models.sh
 ```
 
----
-
-### `scripts/setup_github_ssh.sh`
-
-Optional script for setting up GitHub SSH access on a new Vast.ai instance.
-
-Important:
-
-- Do not commit private SSH keys into this repository.
-- Use a repo-specific deploy key if possible.
-- The script expects the private key to be provided at runtime, preferably as a base64 string.
-
-Run:
+Start baseline:
 
 ```bash
-bash scripts/setup_github_ssh.sh
+nohup bash scripts/serve_qwen_small_baseline.sh > server_baseline.log 2>&1 &
+echo $! > server.pid
+tail -f server_baseline.log
 ```
+
+Run baseline benchmark after `/health` is OK:
+
+```bash
+DECODE_MODE=baseline MODEL_NAME=Qwen3-1.7B bash scripts/run_spec_smoke_benchmark.sh
+kill $(cat server.pid)
+```
+
+Start DraftTarget:
+
+```bash
+nohup bash scripts/serve_qwen_small_draft_target.sh > server_draft_target.log 2>&1 &
+echo $! > server.pid
+tail -f server_draft_target.log
+```
+
+Run DraftTarget benchmark after `/health` is OK:
+
+```bash
+DECODE_MODE=draft_target MODEL_NAME=Qwen3-1.7B bash scripts/run_spec_smoke_benchmark.sh
+kill $(cat server.pid)
+```
+
+Compare:
+
+```bash
+bash scripts/compare_spec_results.sh
+```
+
+Notes:
+
+- TensorRT-LLM 1.1.0 uses `speculative_model_dir`, not `speculative_model`.
+- The draft model must be a **local directory**, not a Hugging Face repo ID.
+- The config is in `configs/spec_draft_target_qwen_small.yaml`.
+
+## 4. Final Baseline Benchmark on 4× RTX PRO 6000 Blackwell
+
+Recommended Vast settings:
+
+- GPU: 4× RTX PRO 6000 Blackwell
+- Disk: at least 700GB, preferably 1TB
+- Image: NVIDIA TensorRT-LLM container
+- Port: 8000
+- Launch mode: SSH or Jupyter + SSH
+
+Clone repo and check environment:
+
+```bash
+cd /workspace
+git clone git@github.com:SRO-SA/trtllm-qwen-benchmark.git
+cd trtllm-qwen-benchmark
+chmod +x scripts/*.sh
+bash scripts/setup_check.sh
+```
+
+Download the model:
+
+```bash
+bash scripts/download_final_model.sh
+```
+
+Start baseline server:
+
+```bash
+MAX_SEQ_LEN=32768 TP_SIZE=4 \
+nohup bash scripts/serve_final_baseline.sh > server_final_baseline_32k.log 2>&1 &
+
+echo $! > server.pid
+tail -f server_final_baseline_32k.log
+```
+
+Check:
+
+```bash
+curl -i http://localhost:8000/health
+curl http://localhost:8000/v1/models
+```
+
+Run conservative baseline first:
+
+```bash
+MODEL_NAME=Qwen3-Coder-480B-A35B-Instruct-NVFP4 \
+OUT=results/final_baseline_32k.csv \
+CONTEXTS="1024 8192 32768" \
+CONCURRENCIES="1 2" \
+bash scripts/run_final_baseline_benchmark.sh
+```
+
+After stable baseline, extend:
+
+```bash
+CONTEXTS="65536 131072" CONCURRENCIES="1" \
+OUT=results/final_baseline_long.csv \
+bash scripts/run_final_baseline_benchmark.sh
+```
+
+## 5. Final DraftTarget Add-on Experiment
+
+Run only after baseline is stable.
+
+Start with a small subset:
+
+```bash
+MAX_SEQ_LEN=8192 TP_SIZE=4 \
+nohup bash scripts/serve_final_draft_target.sh > server_final_draft_target.log 2>&1 &
+
+echo $! > server.pid
+tail -f server_final_draft_target.log
+```
+
+Then:
+
+```bash
+MODEL_NAME=Qwen3-Coder-480B-A35B-Instruct-NVFP4 \
+OUT=results/final_draft_target.csv \
+CONTEXTS="1024 8192" \
+CONCURRENCIES="1" \
+bash scripts/run_final_draft_target_benchmark.sh
+```
+
+Do not start directly with 128k + speculative decoding.
 
 ## Useful Commands
 
@@ -281,225 +256,61 @@ bash scripts/setup_github_ssh.sh
 
 ```bash
 nvidia-smi
-```
-
-Continuous GPU monitoring:
-
-```bash
 watch -n 1 nvidia-smi
 ```
 
-### Check TensorRT-LLM
+### Check TensorRT-LLM flags
 
 ```bash
 which trtllm-serve
 trtllm-serve --help
-trtllm-serve serve --help
+trtllm-serve serve --help | grep -E "tp_size|max_seq_len|extra_llm_api_options|config"
 ```
 
-### Start Server in Background
+### Start a server in the background
 
 ```bash
 nohup bash scripts/serve_small.sh > server.log 2>&1 &
 echo $! > server.pid
-```
-
-### Check Server Log
-
-```bash
 tail -f server.log
 ```
 
-### Check Whether Server Is Running
+### Stop a server
 
 ```bash
-ps aux | grep trtllm
+kill $(cat server.pid)
+# or
+pkill -f trtllm-serve
 ```
 
-### Health Check
-
-```bash
-curl -i http://localhost:8000/health
-```
-
-Expected:
-
-```text
-HTTP/1.1 200 OK
-```
-
-### List Served Models
-
-```bash
-curl http://localhost:8000/v1/models
-```
-
-### Send One Chat Request
-
-```bash
-curl -X POST http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    "messages": [
-      {"role": "user", "content": "Write a short Python function that adds two numbers."}
-    ],
-    "max_tokens": 64,
-    "temperature": 0
-  }'
-```
-
-### Test Streaming Response
-
-```bash
-curl -N -X POST http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    "messages": [
-      {"role": "user", "content": "Say hello in one sentence."}
-    ],
-    "max_tokens": 32,
-    "temperature": 0,
-    "stream": true
-  }'
-```
-
-### Check TensorRT-LLM Metrics
-
-```bash
-curl http://localhost:8000/metrics
-```
-
-Save metrics with timeout:
+### Save metrics
 
 ```bash
 curl -m 10 --connect-timeout 2 -sS \
   http://localhost:8000/metrics \
-  -o results/tensorrt_metrics.json
+  -o results/tensorrt_metrics.json || true
 ```
 
-If `/metrics` hangs, stop it with:
+## GitHub SSH Setup on Vast
+
+The script supports a raw private deploy key, a base64 private key, or a key file:
+
+```bash
+bash scripts/setup_github_ssh.sh
+```
+
+If pasting a raw private key, paste the full key and press `Ctrl+D`.
+
+Private key starts with:
 
 ```text
-Ctrl + C
+-----BEGIN OPENSSH PRIVATE KEY-----
 ```
 
-Then restart the server.
-
-### Stop Server
-
-```bash
-kill $(cat server.pid)
-```
-
-If that does not work:
-
-```bash
-pkill -f trtllm-serve
-```
-
-### Clean Old Results
-
-```bash
-rm -f results/smoke_results.csv
-rm -f results/tensorrt_metrics.json
-```
-
-## Smoke-Test Result
-
-The smoke test successfully produced the following result for 1024 context length:
-
-| Context | Concurrency | TTFT Mean (ms) | TPS Mean | TPS P99 | VRAM Load (GB) | Stability |
-|---:|---:|---:|---:|---:|---:|---|
-| 1024 | 1 | 13.00 | 320.17 | 334.06 | 42.71 | pass |
-| 1024 | 2 | 11.47 | 313.40 | 315.45 | 42.71 | pass |
-| 1024 | 4 | 27.03 | 285.41 | 305.16 | 42.71 | pass |
-
-This confirms that the benchmark pipeline works.
-
-## Notes About the Smoke Test
-
-The TinyLlama smoke test is only for validating the environment and scripts. It is not intended to represent final TensorRT-LLM performance.
-
-The 2048-context smoke test stalled with TinyLlama, likely because the approximate prompt length plus generated tokens reached the model/server context limit. For this reason, the smoke test should stay small.
-
-The final long-context benchmark should be done with Qwen3-Coder-480B on the real 4× RTX PRO 6000 Blackwell machine.
-
-## Final Benchmark Plan
-
-For the real benchmark, use:
-
-- 4× RTX PRO 6000 Blackwell
-- Qwen3-Coder-480B 4-bit quantized model
-- TensorRT-LLM
-- Tensor parallel size 4
-- Local model path under `/workspace/models`
-
-Suggested order:
+Public key starts with:
 
 ```text
-1k context, concurrency 1
-8k context, concurrency 1
-32k context, concurrency 1
-32k context, concurrency 2
-64k context, concurrency 1
-128k context, concurrency 1
+ssh-ed25519 ...
 ```
 
-Then gradually increase concurrency.
-
-Do not start directly with 128k context and high concurrency.
-
-## Final Model Serving Placeholder
-
-The final serving command will depend on the exact Qwen3-Coder-480B 4-bit checkpoint format.
-
-Expected shape:
-
-```bash
-MODEL_PATH="/workspace/models/Qwen3-Coder-480B-AWQ"
-
-trtllm-serve serve \
-  --backend pytorch \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --tp_size 4 \
-  "${MODEL_PATH}"
-```
-
-Before running the final model, check the available TensorRT-LLM flags:
-
-```bash
-trtllm-serve serve --help
-```
-
-Useful flags may include:
-
-```text
---tp_size
---max_seq_len
---backend
---host
---port
---extra_llm_api_options
-```
-
-## Recommended Final Workflow
-
-1. Rent the 4× RTX PRO 6000 Blackwell instance.
-2. Clone this repository.
-3. Run `scripts/setup_check.sh`.
-4. Download or sync the Qwen3-Coder-480B 4-bit model to local disk.
-5. Start TensorRT-LLM server in background.
-6. Run a 1k context sanity request.
-7. Run the benchmark from small context to long context.
-8. Save CSV results and TensorRT metrics.
-9. Upload results to GitHub or cloud storage.
-10. Stop/destroy the Vast instance when finished.
-
-## Safety Note
-
-Do not store GitHub private keys, Hugging Face tokens, cloud credentials, or model access tokens directly in this repository.
-
-Use environment variables, Vast secrets, or runtime prompts instead.
+The Vast instance needs the **private** key. GitHub receives the **public** key as a repo deploy key.

@@ -3,9 +3,10 @@ enable_iter_perf_stats: true
 speculative_config:
   decoding_type: DraftTarget
   max_draft_len: 2
+  # For final speculative test, download/set a local draft model path.
+  # This path can be overridden by editing this config before launch.
   speculative_model_dir: /workspace/models/Qwen3-0.6B
   max_concurrency: 1
 
 kv_cache_config:
-  free_gpu_memory_fraction: 0.20
-  max_tokens: 1024
+  free_gpu_memory_fraction: 0.60

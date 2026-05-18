@@ -1,6 +1,7 @@
 import argparse
 import csv
 import json
+import os
 import statistics
 import subprocess
 import time
@@ -49,16 +50,21 @@ def mean_gpu_util(snapshot):
 
 
 def make_prompt(context_len):
-    # Approximate token length for smoke testing.
-    # For real final benchmarking, replace this with tokenizer-based prompt generation.
+    # Approximate token length for smoke/final synthetic code-context tests.
+    # We use ~4 chars/token as a rough estimate. For formal paper-quality numbers,
+    # replace this with tokenizer-based prompt generation.
     base = "You are a coding assistant. Analyze the following synthetic context and answer briefly.\n\n"
-    repeated = "def foo(x): return x + 1\n"
-    target_chars = context_len * 4
+    repeated = (
+        "def foo(x):\n"
+        "    y = x + 1\n"
+        "    return y\n\n"
+    )
+    target_chars = max(1, context_len) * 4
     body = repeated * max(1, target_chars // len(repeated))
     return base + body + "\nQuestion: Write one sentence summarizing what the code does."
 
 
-def run_one_request(url, model, context_len, max_tokens, request_id):
+def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s):
     prompt = make_prompt(context_len)
     payload = {
         "model": model,
@@ -75,9 +81,11 @@ def run_one_request(url, model, context_len, max_tokens, request_id):
     output_text = ""
     completion_tokens = None
     error = None
+    status_code = None
 
     try:
-        with requests.post(url, json=payload, stream=True, timeout=600) as r:
+        with requests.post(url, json=payload, stream=True, timeout=timeout_s) as r:
+            status_code = r.status_code
             r.raise_for_status()
 
             for raw_line in r.iter_lines(decode_unicode=True):
@@ -119,7 +127,7 @@ def run_one_request(url, model, context_len, max_tokens, request_id):
     if first_token_time is not None:
         ttft_ms = (first_token_time - start) * 1000.0
 
-    total_time_s = max(end - start, 1e-9)
+    total_time_s = max((end or time.perf_counter()) - start, 1e-9)
 
     # If server does not return usage in streaming mode, use a rough fallback.
     if completion_tokens is None:
@@ -130,6 +138,7 @@ def run_one_request(url, model, context_len, max_tokens, request_id):
     return {
         "request_id": request_id,
         "success": error is None,
+        "status_code": status_code,
         "error": error or "",
         "ttft_ms": ttft_ms,
         "total_time_s": total_time_s,
@@ -139,11 +148,11 @@ def run_one_request(url, model, context_len, max_tokens, request_id):
     }
 
 
-def p99(values):
+def percentile(values, q):
     if not values:
         return None
     values = sorted(values)
-    idx = int(0.99 * (len(values) - 1))
+    idx = int(q * (len(values) - 1))
     return values[idx]
 
 
@@ -154,10 +163,12 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--framework", default="tensorrt-llm")
     parser.add_argument("--quantization", default="smoke-test")
+    parser.add_argument("--decode-mode", default="baseline", help="baseline, draft_target, eagle3, etc.")
     parser.add_argument("--context-len", type=int, default=1024)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--num-requests", type=int, default=4)
     parser.add_argument("--max-tokens", type=int, default=64)
+    parser.add_argument("--timeout-s", type=float, default=600)
     parser.add_argument("--output", default="results/smoke_results.csv")
     args = parser.parse_args()
 
@@ -178,6 +189,7 @@ def main():
                 args.context_len,
                 args.max_tokens,
                 i,
+                args.timeout_s,
             )
             for i in range(args.num_requests)
         ]
@@ -195,11 +207,15 @@ def main():
 
     ttfts = [r["ttft_ms"] for r in successes if r["ttft_ms"] is not None]
     tps_vals = [r["tps"] for r in successes if r["tps"] is not None]
+    total_output_tokens = sum(r["completion_tokens"] for r in successes)
+    total_time_s = max(end_wall - start_wall, 1e-9)
+    aggregate_tps = total_output_tokens / total_time_s
 
     row = {
         "framework": args.framework,
         "model": args.model,
         "quantization": args.quantization,
+        "decode_mode": args.decode_mode,
         "gpu_type": "; ".join(sorted(set(g.get("gpu_name", "unknown") for g in load_gpu))),
         "num_gpus": len([g for g in load_gpu if "gpu_index" in g]),
         "context_len": args.context_len,
@@ -210,12 +226,13 @@ def main():
         "failed_requests": len(failures),
         "ttft_mean_ms": statistics.mean(ttfts) if ttfts else "",
         "ttft_p50_ms": statistics.median(ttfts) if ttfts else "",
-        "ttft_p99_ms": p99(ttfts) if ttfts else "",
+        "ttft_p99_ms": percentile(ttfts, 0.99) if ttfts else "",
         "tps_mean": statistics.mean(tps_vals) if tps_vals else "",
         "tps_p50": statistics.median(tps_vals) if tps_vals else "",
-        "tps_p99": p99(tps_vals) if tps_vals else "",
-        "total_output_tokens": sum(r["completion_tokens"] for r in successes),
-        "total_time_s": end_wall - start_wall,
+        "tps_p99": percentile(tps_vals, 0.99) if tps_vals else "",
+        "aggregate_tps": aggregate_tps,
+        "total_output_tokens": total_output_tokens,
+        "total_time_s": total_time_s,
         "vram_idle_gb": vram_idle_gb,
         "vram_load_gb": vram_load_gb,
         "kv_cache_growth_gb": max(0.0, vram_load_gb - vram_idle_gb),
@@ -226,9 +243,7 @@ def main():
     }
 
     fieldnames = list(row.keys())
-
-    import os
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
 
     write_header = not os.path.exists(args.output)
     with open(args.output, "a", newline="") as f:

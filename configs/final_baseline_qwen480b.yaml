@@ -1,0 +1,6 @@
+enable_iter_perf_stats: true
+
+kv_cache_config:
+  # Lower than the default to reduce startup OOM risk on huge models.
+  # Increase after baseline loading is stable.
+  free_gpu_memory_fraction: 0.70

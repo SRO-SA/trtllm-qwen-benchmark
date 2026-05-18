@@ -3,33 +3,33 @@ set -euo pipefail
 
 source "$(dirname "$0")/common_env.sh"
 
-MODEL_NAME="${MODEL_NAME:-$TINY_MODEL}"
-OUT="${OUT:-results/smoke_results.csv}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-Coder-480B-A35B-Instruct-NVFP4}"
+OUT="${OUT:-results/final_baseline.csv}"
 
 mkdir -p results
 
-# Keep TinyLlama smoke test small to avoid context-limit stalls.
-CONTEXTS="${CONTEXTS:-256 512 1024}"
-CONCURRENCIES="${CONCURRENCIES:-1 2 4}"
+# Start conservative. Add 64k/128k only after 1k/8k/32k are stable.
+CONTEXTS="${CONTEXTS:-1024 8192 32768}"
+CONCURRENCIES="${CONCURRENCIES:-1 2}"
 
 for CONTEXT in $CONTEXTS; do
   for CONCURRENCY in $CONCURRENCIES; do
-    echo "Running smoke benchmark: context=$CONTEXT, concurrency=$CONCURRENCY"
+    echo "Running final baseline: context=$CONTEXT concurrency=$CONCURRENCY"
 
     "$PYTHON_BIN" benchmark/benchmark_openai_stream.py \
       --host localhost \
       --port "$PORT" \
       --model "$MODEL_NAME" \
       --framework tensorrt-llm \
-      --quantization smoke-test \
+      --quantization nvfp4 \
       --context-len "$CONTEXT" \
       --concurrency "$CONCURRENCY" \
       --num-requests "${NUM_REQUESTS:-8}" \
-      --max-tokens "${MAX_TOKENS:-64}" \
-      --decode-mode "${DECODE_MODE:-baseline}" \
+      --max-tokens "${MAX_TOKENS:-256}" \
+      --decode-mode baseline \
       --output "$OUT"
   done
 done
 
-echo "Smoke benchmark finished."
+echo "Final baseline benchmark finished."
 cat "$OUT"
