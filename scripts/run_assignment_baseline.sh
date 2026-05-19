@@ -48,6 +48,9 @@ STRICT_SERVER_LIMITS="${STRICT_SERVER_LIMITS:-0}"
 
 # Long-context concurrency >1 is optional. Multi-user scalability is covered by 1k/8k.
 INCLUDE_32K_CONCURRENCY2="${INCLUDE_32K_CONCURRENCY2:-0}"
+# Optional: run only one assignment stage, e.g. RUN_ONLY_STAGE=long_128k.
+# Valid values: short_1k_multiuser, medium_8k_multiuser, long_32k, long_64k, long_128k, all.
+RUN_ONLY_STAGE="${RUN_ONLY_STAGE:-all}"
 
 mkdir -p results "$LOG_DIR" "$METRICS_DIR" "$RUNTIME_CONFIG_DIR"
 touch benchmark/__init__.py 2>/dev/null || true
@@ -461,6 +464,12 @@ if [[ "$INCLUDE_32K_CONCURRENCY2" == "1" ]]; then
   LONG32_CONCURRENCIES="1 2"
 fi
 
+
+should_run_stage() {
+  local STAGE="$1"
+  [[ "$RUN_ONLY_STAGE" == "all" || "$RUN_ONLY_STAGE" == "$STAGE" ]]
+}
+
 # Stage-specific workload sizes. These keep the assignment input context lengths
 # unchanged, but avoid running 8 repeated 64k/128k requests with long generation.
 SHORT_NUM_REQUESTS="${SHORT_NUM_REQUESTS:-8}"
@@ -483,11 +492,11 @@ LONG32_API_MODE="${LONG32_API_MODE:-chat}"
 LONG64_API_MODE="${LONG64_API_MODE:-completion}"
 LONG128_API_MODE="${LONG128_API_MODE:-completion}"
 
-run_stage "short_1k_multiuser" "$SHORT_SEQ" "$SHORT_TOK" "1024" "1 2 4 8" "$SHORT_BATCH" "$SHORT_CUDA_BATCHES" "$SHORT_KV" "$SHORT_CHUNKED_PREFILL" "$SHORT_NUM_REQUESTS" "$SHORT_MAX_NEW_TOKENS" "${SHORT_FIRST_TOKEN_TIMEOUT_S:-$TIMEOUT_S}" "$SHORT_API_MODE"
-run_stage "medium_8k_multiuser" "$MED_SEQ" "$MED_TOK" "8192" "1 2 4" "$MED_BATCH" "$MED_CUDA_BATCHES" "$MED_KV" "$MED_CHUNKED_PREFILL" "$MED_NUM_REQUESTS" "$MED_MAX_NEW_TOKENS" "${MED_FIRST_TOKEN_TIMEOUT_S:-$TIMEOUT_S}" "$MED_API_MODE"
-run_stage "long_32k" "$LONG32_SEQ" "$LONG32_TOK" "32768" "$LONG32_CONCURRENCIES" "$LONG_BATCH" "$LONG_CUDA_BATCHES" "$LONG32_KV" "$LONG_CHUNKED_PREFILL" "$LONG32_NUM_REQUESTS" "$LONG32_MAX_NEW_TOKENS" "${LONG32_FIRST_TOKEN_TIMEOUT_S:-900}" "$LONG32_API_MODE"
-run_stage "long_64k" "$LONG64_SEQ" "$LONG64_TOK" "65536" "1" "$LONG_BATCH" "$LONG_CUDA_BATCHES" "$LONG64_KV" "$LONG_CHUNKED_PREFILL" "$LONG64_NUM_REQUESTS" "$LONG64_MAX_NEW_TOKENS" "${LONG64_FIRST_TOKEN_TIMEOUT_S:-900}" "$LONG64_API_MODE"
-run_stage "long_128k" "$LONG128_SEQ" "$LONG128_TOK" "131072" "1" "$LONG_BATCH" "$LONG_CUDA_BATCHES" "$LONG128_KV" "$LONG_CHUNKED_PREFILL" "$LONG128_NUM_REQUESTS" "$LONG128_MAX_NEW_TOKENS" "${LONG128_FIRST_TOKEN_TIMEOUT_S:-1200}" "$LONG128_API_MODE"
+should_run_stage "short_1k_multiuser" && run_stage "short_1k_multiuser" "$SHORT_SEQ" "$SHORT_TOK" "1024" "1 2 4 8" "$SHORT_BATCH" "$SHORT_CUDA_BATCHES" "$SHORT_KV" "$SHORT_CHUNKED_PREFILL" "$SHORT_NUM_REQUESTS" "$SHORT_MAX_NEW_TOKENS" "${SHORT_FIRST_TOKEN_TIMEOUT_S:-$TIMEOUT_S}" "$SHORT_API_MODE"
+should_run_stage "medium_8k_multiuser" && run_stage "medium_8k_multiuser" "$MED_SEQ" "$MED_TOK" "8192" "1 2 4" "$MED_BATCH" "$MED_CUDA_BATCHES" "$MED_KV" "$MED_CHUNKED_PREFILL" "$MED_NUM_REQUESTS" "$MED_MAX_NEW_TOKENS" "${MED_FIRST_TOKEN_TIMEOUT_S:-$TIMEOUT_S}" "$MED_API_MODE"
+should_run_stage "long_32k" && run_stage "long_32k" "$LONG32_SEQ" "$LONG32_TOK" "32768" "$LONG32_CONCURRENCIES" "$LONG_BATCH" "$LONG_CUDA_BATCHES" "$LONG32_KV" "$LONG_CHUNKED_PREFILL" "$LONG32_NUM_REQUESTS" "$LONG32_MAX_NEW_TOKENS" "${LONG32_FIRST_TOKEN_TIMEOUT_S:-900}" "$LONG32_API_MODE"
+should_run_stage "long_64k" && run_stage "long_64k" "$LONG64_SEQ" "$LONG64_TOK" "65536" "1" "$LONG_BATCH" "$LONG_CUDA_BATCHES" "$LONG64_KV" "$LONG_CHUNKED_PREFILL" "$LONG64_NUM_REQUESTS" "$LONG64_MAX_NEW_TOKENS" "${LONG64_FIRST_TOKEN_TIMEOUT_S:-900}" "$LONG64_API_MODE"
+should_run_stage "long_128k" && run_stage "long_128k" "$LONG128_SEQ" "$LONG128_TOK" "131072" "1" "$LONG_BATCH" "$LONG_CUDA_BATCHES" "$LONG128_KV" "$LONG_CHUNKED_PREFILL" "$LONG128_NUM_REQUESTS" "$LONG128_MAX_NEW_TOKENS" "${LONG128_FIRST_TOKEN_TIMEOUT_S:-1200}" "$LONG128_API_MODE"
 
 echo "============================================================"
 echo "Assignment baseline benchmark complete."

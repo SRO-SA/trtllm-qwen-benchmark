@@ -25,6 +25,48 @@ else
   fi
 fi
 
+
+# TensorRT-LLM PyTorch backend launches MPI worker processes that may survive
+# after the trtllm-serve parent is killed. If they remain alive, port 8000 may
+# be free but GPUs are still occupied, poisoning the next retry attempt.
+echo "Checking TensorRT-LLM MPI worker processes..."
+MPI_PIDS="$(pgrep -f "mpi4py.futures.server" || true)"
+if [[ -n "$MPI_PIDS" ]]; then
+  echo "Found mpi4py TensorRT-LLM worker process(es):"
+  echo "$MPI_PIDS"
+  echo "Trying graceful kill for MPI workers..."
+  pkill -TERM -f "mpi4py.futures.server" || true
+  sleep 5
+  MPI_LEFT="$(pgrep -f "mpi4py.futures.server" || true)"
+  if [[ -n "$MPI_LEFT" ]]; then
+    echo "Some mpi4py workers are still alive:"
+    echo "$MPI_LEFT"
+    echo "Force killing MPI workers..."
+    pkill -9 -f "mpi4py.futures.server" || true
+    sleep 3
+  fi
+else
+  echo "No mpi4py TensorRT-LLM worker processes found."
+fi
+
+# Extra cleanup for child Python workers that still reference the model path.
+# This intentionally avoids generic `pkill python` so Jupyter remains alive.
+MODEL_CLEANUP_PATTERN="${MODEL_NAME:-Qwen3-Coder-480B-A35B-Instruct-NVFP4}"
+MODEL_PIDS="$(pgrep -f "$MODEL_CLEANUP_PATTERN" || true)"
+if [[ -n "$MODEL_PIDS" ]]; then
+  echo "Found leftover model-related Python process(es):"
+  echo "$MODEL_PIDS"
+  pkill -TERM -f "$MODEL_CLEANUP_PATTERN" || true
+  sleep 5
+  MODEL_LEFT="$(pgrep -f "$MODEL_CLEANUP_PATTERN" || true)"
+  if [[ -n "$MODEL_LEFT" ]]; then
+    echo "Force killing leftover model-related process(es):"
+    echo "$MODEL_LEFT"
+    pkill -9 -f "$MODEL_CLEANUP_PATTERN" || true
+    sleep 3
+  fi
+fi
+
 # Kill any remaining process that owns/binds PORT, even if its cmdline no longer
 # contains trtllm-serve. This handles uvicorn/python workers left after Ctrl+C.
 python3 - <<PY

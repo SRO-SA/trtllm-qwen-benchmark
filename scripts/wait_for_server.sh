@@ -37,6 +37,8 @@ while true; do
     if [[ -n "${PID:-}" ]] && ! kill -0 "$PID" 2>/dev/null; then
       echo "ERROR: Server process PID ${PID} exited before health check became ready."
       SERVER_LOG="$SERVER_LOG" bash scripts/diagnose_server.sh || true
+      echo "Running full TensorRT-LLM cleanup after early server exit..."
+      bash scripts/stop_trtllm_server.sh || true
       exit 1
     fi
   fi
@@ -76,6 +78,8 @@ while true; do
         fi
       fi
       SERVER_LOG="$SERVER_LOG" bash scripts/diagnose_server.sh || true
+      echo "Running full TensorRT-LLM cleanup after startup hang..."
+      bash scripts/stop_trtllm_server.sh || true
       exit 124
     fi
   fi
