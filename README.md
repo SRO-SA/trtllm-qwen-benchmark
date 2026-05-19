@@ -523,3 +523,31 @@ NUM_REQUESTS=1
 ```
 
 If it still prints `MAX_NEW_TOKENS=256` or `NUM_REQUESTS=8` during the 64k stage, the updated script is not being used.
+
+
+## May 19 long-context stability patch
+
+This repo version fixes a TensorRT-LLM 1.1.0 long-context stall observed at 64K. The server accepted the request with HTTP 200, but logged a negative `default_max_tokens` warning because the effective internal input length stayed around 32K even though `--max_seq_len` and `--max_num_tokens` were larger. The assignment runner now writes `max_input_len`, `max_seq_len`, and `max_num_tokens` into each generated `--extra_llm_api_options` YAML, including the mirrored `build_config` values.
+
+The assignment context lengths are unchanged: 1K, 8K, 32K, 64K, and 128K. Long-context stages use fewer repeated requests to avoid extremely long wall-clock runs: 32K uses 4 requests / 128 output tokens, 64K uses 1 request / 64 output tokens, and 128K uses 1 request / 32 output tokens.
+
+Before each full run:
+
+```bash
+bash scripts/stop_trtllm_server.sh || true
+bash scripts/clean_assignment_outputs.sh
+```
+
+Then run:
+
+```bash
+RESET_RESULTS=1 MODEL_PATH=/workspace/models/Qwen3-Coder-480B-A35B-Instruct-NVFP4 MODEL_NAME=Qwen3-Coder-480B-A35B-Instruct-NVFP4 PLAN_MODEL=/workspace/models/Qwen3-Coder-480B-A35B-Instruct-NVFP4 TOKENIZER_PATH=/workspace/models/Qwen3-Coder-480B-A35B-Instruct-NVFP4 PROMPT_TOKEN_RESERVE=1024 TP_SIZE=4 QUANTIZATION=nvfp4 WAIT_TIMEOUT_S=3600 TIMEOUT_S=1800 CASE_TIMEOUT_S=3600 BENCHMARK_HEARTBEAT_S=60 DEBUG_BENCHMARK_REQUESTS=1 PYTHONPATH=$PWD bash scripts/run_assignment_baseline.sh
+```
+
+For 64K, verify the generated config contains the long input capacity:
+
+```bash
+grep -nE "max_input_len|max_seq_len|max_num_tokens" results/runtime_configs/config_long_64k.yaml
+```
+
+Expected 64K benchmark printout should include `MAX_NEW_TOKENS=64` and `NUM_REQUESTS=1`.

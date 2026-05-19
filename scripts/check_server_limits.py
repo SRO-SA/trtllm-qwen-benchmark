@@ -6,11 +6,18 @@ from pathlib import Path
 
 
 def extract_last_int(patterns, text):
-    last = None
+    """Return the integer from the chronologically last regex match."""
+    matches = []
     for pattern in patterns:
         for m in re.finditer(pattern, text):
-            last = int(m.group(1))
-    return last
+            try:
+                matches.append((m.start(), int(m.group(1))))
+            except Exception:
+                pass
+    if not matches:
+        return None
+    matches.sort(key=lambda x: x[0])
+    return matches[-1][1]
 
 
 def main():
@@ -30,14 +37,17 @@ def main():
     max_seq_len = extract_last_int([
         r"max_seq_len=(\d+)",
         r"Max seq len:\s*(\d+)",
+        r"build_config=BuildConfig\([^\n]*max_seq_len=(\d+)",
     ], text)
     max_num_tokens = extract_last_int([
         r"max_num_tokens=(\d+)",
         r"Max num tokens:\s*(\d+)",
+        r"build_config=BuildConfig\([^\n]*max_num_tokens=(\d+)",
     ], text)
     max_input_len = extract_last_int([
         r"max_input_len=(\d+)",
         r"Max input len:\s*(\d+)",
+        r"build_config=BuildConfig\([^\n]*max_input_len=(\d+)",
     ], text)
 
     print("Parsed TensorRT-LLM server limits:")
@@ -59,12 +69,21 @@ def main():
     elif max_num_tokens < args.required_num_tokens:
         errors.append(f"max_num_tokens_too_small:{max_num_tokens}<{args.required_num_tokens}")
 
-    # max_input_len is useful but not always enforced/reported the same way.
-    if max_input_len is not None and max_input_len < args.required_num_tokens:
+    # For long-context serving this is required. In TensorRT-LLM 1.1.0, the CLI may
+    # not expose --max_input_len, so run_assignment_baseline.sh writes it into the
+    # extra LLM YAML. If it remains at 1024/32768, 64k/128k can get HTTP 200 but stall.
+    if max_input_len is None:
+        errors.append("could_not_parse_max_input_len")
+    elif max_input_len < args.required_num_tokens:
         errors.append(f"max_input_len_too_small:{max_input_len}<{args.required_num_tokens}")
 
     if errors:
         print("ERROR: server limits are not sufficient: " + ";".join(errors))
+        return 1
+
+    # Detect the known internal stall warning early if checking after a request.
+    if re.search(r"default_max_tokens \(-?\d+\).*splited_prompt_len", text):
+        print("ERROR: server log contains TensorRT-LLM negative default_max_tokens warning; long-context request likely stalled.")
         return 1
 
     print("Server limits are sufficient for this stage.")

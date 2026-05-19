@@ -184,8 +184,13 @@ def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s):
     status_code = None
 
     try:
-        _debug_print(f"[request {request_id}] Sending request to server...")
-        with requests.post(url, json=payload, stream=True, timeout=timeout_s) as r:
+        connect_timeout_s = float(os.environ.get("REQUEST_CONNECT_TIMEOUT_S", "10"))
+        read_timeout_s = float(os.environ.get("REQUEST_READ_TIMEOUT_S", os.environ.get("FIRST_TOKEN_TIMEOUT_S", str(timeout_s))))
+        _debug_print(
+            f"[request {request_id}] Sending request to server "
+            f"(connect_timeout={connect_timeout_s}s, read_timeout={read_timeout_s}s)..."
+        )
+        with requests.post(url, json=payload, stream=True, timeout=(connect_timeout_s, read_timeout_s)) as r:
             status_code = r.status_code
             _debug_print(f"[request {request_id}] HTTP status={status_code}; waiting for stream tokens...")
             r.raise_for_status()
@@ -229,6 +234,8 @@ def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s):
     except Exception as e:
         end = time.perf_counter()
         error = repr(e)
+        if first_token_time is None and ("Read timed out" in error or "ReadTimeout" in error):
+            error = "first_token_timeout_or_server_stall: " + error
         _debug_print(f"[request {request_id}] Request failed after {end - start:.2f}s: {error}")
 
     ttft_ms = None
