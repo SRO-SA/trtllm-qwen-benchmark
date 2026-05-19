@@ -267,6 +267,13 @@ def main():
     results = []
     start_wall = time.perf_counter()
 
+    print(
+        f"Starting benchmark requests: context={args.context_len}, "
+        f"concurrency={args.concurrency}, num_requests={args.num_requests}, "
+        f"max_tokens={args.max_tokens}, timeout_s={args.timeout_s}",
+        flush=True,
+    )
+
     with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
         futures = [
             ex.submit(
@@ -281,8 +288,20 @@ def main():
             for i in range(args.num_requests)
         ]
 
+        completed = 0
         for fut in as_completed(futures):
-            results.append(fut.result())
+            result = fut.result()
+            results.append(result)
+            completed += 1
+            status = "ok" if result.get("success") else "fail"
+            print(
+                f"Completed request {completed}/{args.num_requests} "
+                f"(id={result.get('request_id')}, status={status}, "
+                f"ttft_ms={result.get('ttft_ms')}, "
+                f"total_time_s={result.get('total_time_s'):.2f}, "
+                f"prompt_tokens={result.get('prompt_tokens_reported') or result.get('prompt_tokens_est')})",
+                flush=True,
+            )
 
     end_wall = time.perf_counter()
 

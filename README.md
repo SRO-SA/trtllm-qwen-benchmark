@@ -476,3 +476,50 @@ TIMEOUT_S=1800 \
 CASE_TIMEOUT_S=2400 \
 bash scripts/run_assignment_baseline.sh
 ```
+
+## Latest assignment-runner fixes
+
+This repo version includes the final fixes for the 4× RTX PRO 6000 Blackwell + TensorRT-LLM + Qwen3-Coder-480B NVFP4 assignment run:
+
+- `run_assignment_baseline.sh` now keeps the required assignment input contexts unchanged: 1k, 8k, 32k, 64k, and 128k.
+- Long-context stages now use stage-specific workloads so they do not run 8 repeated huge requests:
+  - 32k: `LONG32_NUM_REQUESTS=4`, `LONG32_MAX_NEW_TOKENS=128`
+  - 64k: `LONG64_NUM_REQUESTS=1`, `LONG64_MAX_NEW_TOKENS=64`
+  - 128k: `LONG128_NUM_REQUESTS=1`, `LONG128_MAX_NEW_TOKENS=32`
+- Generated `cuda_graph_config` no longer sets both `batch_sizes` and `max_batch_size`, because TensorRT-LLM 1.1.0 rejects that combination.
+- `stop_trtllm_server.sh` now also kills any leftover process owning port 8000, even if its command line no longer contains `trtllm-serve`.
+- `benchmark_openai_stream.py` prints per-request progress, which makes long-context runs easier to distinguish from a true hang.
+- `scripts/clean_assignment_outputs.sh` backs up and cleans generated results/config/log folders before a clean rerun.
+
+Recommended clean rerun on Vast:
+
+```bash
+cd ~/workspace/trtllm-qwen-benchmark
+bash scripts/stop_trtllm_server.sh || true
+bash scripts/clean_assignment_outputs.sh
+
+RESET_RESULTS=1 \
+MODEL_PATH=/workspace/models/Qwen3-Coder-480B-A35B-Instruct-NVFP4 \
+MODEL_NAME=Qwen3-Coder-480B-A35B-Instruct-NVFP4 \
+PLAN_MODEL=/workspace/models/Qwen3-Coder-480B-A35B-Instruct-NVFP4 \
+TOKENIZER_PATH=/workspace/models/Qwen3-Coder-480B-A35B-Instruct-NVFP4 \
+PROMPT_TOKEN_RESERVE=1024 \
+TP_SIZE=4 \
+QUANTIZATION=nvfp4 \
+WAIT_TIMEOUT_S=3600 \
+TIMEOUT_S=1800 \
+CASE_TIMEOUT_S=3600 \
+PYTHONPATH=$PWD \
+bash scripts/run_assignment_baseline.sh
+```
+
+When the 64k stage starts, verify the log prints:
+
+```text
+Stage max new tokens: 64
+Stage num requests: 1
+MAX_NEW_TOKENS=64
+NUM_REQUESTS=1
+```
+
+If it still prints `MAX_NEW_TOKENS=256` or `NUM_REQUESTS=8` during the 64k stage, the updated script is not being used.
