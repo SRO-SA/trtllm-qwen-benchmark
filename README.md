@@ -585,3 +585,24 @@ If 64K or 128K OOMs at server initialization, reduce only that stage's KV fracti
 
 ### Note on HTTP 400 from chat endpoint
 TensorRT-LLM 1.1.0 may reject `max_completion_tokens` on `/v1/chat/completions` with HTTP 400. The benchmark now sends only `max_tokens` by default for chat mode. To test a newer server that requires `max_completion_tokens`, set `INCLUDE_MAX_COMPLETION_TOKENS=1`.
+
+## 128K KV retry ladder
+
+The 128K assignment stage now uses a KV-cache retry ladder instead of a single fixed `free_gpu_memory_fraction`. This is necessary because 128K has two opposite failure modes:
+
+- If KV reservation is too small, the server may start but the actual KV-cache window is smaller than the 128K prompt, which causes a request stall.
+- If KV reservation is too large, TensorRT-LLM may fail during executor creation with CUDA OOM.
+
+By default, `run_assignment_baseline.sh` tries:
+
+```bash
+LONG128_KV_LADDER="0.75 0.70 0.65 0.60 0.55 0.50 0.45"
+```
+
+For each attempt, the runner checks the TensorRT-LLM server log using `scripts/check_kv_window.py`. It only sends the 128K request if the reported KV-cache `window size` is at least:
+
+```text
+context_len + max_new_tokens + safety_tokens
+```
+
+If all attempts fail, the script records one clean failure row for the 128K stage instead of multiple duplicate rows.

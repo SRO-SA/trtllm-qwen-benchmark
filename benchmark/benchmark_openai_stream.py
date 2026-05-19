@@ -188,6 +188,42 @@ def make_prompt(context_len: int) -> Tuple[str, int, int]:
     return prompt, len(ids), target_prompt_tokens
 
 
+def _extract_text_and_usage_from_response(obj, api_mode):
+    """Return (text, completion_tokens, prompt_tokens) from OpenAI-style JSON."""
+    text = ""
+    completion_tokens = None
+    prompt_tokens = None
+
+    usage = obj.get("usage") if isinstance(obj, dict) else None
+    if usage:
+        completion_tokens = usage.get("completion_tokens", completion_tokens)
+        prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
+
+    choices = obj.get("choices", []) if isinstance(obj, dict) else []
+    for choice in choices:
+        if api_mode == "completion":
+            text += choice.get("text", "") or ""
+        else:
+            # Streaming chat uses delta.content; non-streaming chat uses message.content.
+            delta = choice.get("delta", {}) or {}
+            message = choice.get("message", {}) or {}
+            text += delta.get("content", "") or message.get("content", "") or ""
+    return text, completion_tokens, prompt_tokens
+
+
+def _count_output_tokens_fallback(output_text: str, tokenizer_path: Optional[str]) -> int:
+    if not output_text:
+        return 0
+    tokenizer = _get_tokenizer(tokenizer_path)
+    if tokenizer is not None:
+        try:
+            return len(tokenizer.encode(output_text, add_special_tokens=False))
+        except Exception:
+            pass
+    # Last fallback: word count, at least 1 if non-empty.
+    return max(1, len(output_text.split()))
+
+
 def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s, api_mode):
     prompt_build_start = time.perf_counter()
     _debug_print(f"[request {request_id}] Building prompt for context={context_len}...")
@@ -206,14 +242,19 @@ def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s, 
         # /v1/completions maps max_tokens directly to generated tokens in many
         # OpenAI-compatible servers. We use this for very long prompts when the
         # chat endpoint may compute an invalid default_max_tokens internally.
+        # Some TensorRT-LLM versions ignore streaming for /v1/completions and
+        # return one normal JSON object instead of SSE. The parser below handles
+        # both cases.
+        completion_stream = _env_flag("COMPLETION_STREAM", "1")
         payload = {
             "model": model,
             "prompt": prompt,
             "max_tokens": max_tokens,
             "temperature": 0,
-            "stream": True,
+            "stream": completion_stream,
         }
     else:
+        completion_stream = True
         # TensorRT-LLM 1.1.0's OpenAI chat endpoint rejects some newer
         # OpenAI request fields. In particular, max_completion_tokens can cause
         # an immediate HTTP 400 on otherwise valid 1k/8k requests. Therefore
@@ -245,72 +286,114 @@ def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s, 
         read_timeout_s = float(os.environ.get("REQUEST_READ_TIMEOUT_S", os.environ.get("FIRST_TOKEN_TIMEOUT_S", str(timeout_s))))
         _debug_print(
             f"[request {request_id}] Sending {api_mode} request to server "
-            f"(connect_timeout={connect_timeout_s}s, read_timeout={read_timeout_s}s)..."
+            f"(connect_timeout={connect_timeout_s}s, read_timeout={read_timeout_s}s, "
+            f"stream={payload.get('stream')})..."
         )
-        with requests.post(url, json=payload, stream=True, timeout=(connect_timeout_s, read_timeout_s)) as r:
+
+        if not payload.get("stream"):
+            # Non-streaming completion path: TTFT is not observable, but total latency
+            # and output tokens/TPS are recorded reliably.
+            r = requests.post(url, json=payload, timeout=(connect_timeout_s, read_timeout_s))
             status_code = r.status_code
-            _debug_print(f"[request {request_id}] HTTP status={status_code}; waiting for stream tokens...")
+            _debug_print(f"[request {request_id}] HTTP status={status_code}; parsing full JSON response...")
             if status_code >= 400:
-                try:
-                    body = r.text[:2000]
-                except Exception as body_exc:
-                    body = f"<could not read response body: {body_exc!r}>"
-                _debug_print(f"[request {request_id}] HTTP error body: {body}")
+                body = r.text[:2000]
                 error = f"HTTPError({status_code}): {body}"
                 end = time.perf_counter()
-                return {
-                    "request_id": request_id,
-                    "success": False,
-                    "ttft_ms": None,
-                    "tps": None,
-                    "output_tokens": 0,
-                    "latency_s": end - start,
-                    "error": error,
-                    "target_prompt_tokens": target_prompt_tokens,
-                    "prompt_tokens_est": prompt_tokens_est,
-                    "prompt_tokens_reported": prompt_tokens_reported,
-                }
-            r.raise_for_status()
+            else:
+                obj = r.json()
+                chunk_text, c_toks, p_toks = _extract_text_and_usage_from_response(obj, api_mode)
+                output_text += chunk_text
+                completion_tokens = c_toks if c_toks is not None else completion_tokens
+                prompt_tokens_reported = p_toks if p_toks is not None else prompt_tokens_reported
+                end = time.perf_counter()
+        else:
+            non_sse_lines = []
+            saw_sse = False
+            with requests.post(url, json=payload, stream=True, timeout=(connect_timeout_s, read_timeout_s)) as r:
+                status_code = r.status_code
+                _debug_print(f"[request {request_id}] HTTP status={status_code}; waiting for stream tokens...")
+                if status_code >= 400:
+                    try:
+                        body = r.text[:2000]
+                    except Exception as body_exc:
+                        body = f"<could not read response body: {body_exc!r}>"
+                    _debug_print(f"[request {request_id}] HTTP error body: {body}")
+                    error = f"HTTPError({status_code}): {body}"
+                    end = time.perf_counter()
+                    return {
+                        "request_id": request_id,
+                        "success": False,
+                        "ttft_ms": None,
+                        "tps": None,
+                        "output_tokens": 0,
+                        "latency_s": end - start,
+                        "error": error,
+                        "target_prompt_tokens": target_prompt_tokens,
+                        "prompt_tokens_est": prompt_tokens_est,
+                        "prompt_tokens_reported": prompt_tokens_reported,
+                    }
+                r.raise_for_status()
 
-            for raw_line in r.iter_lines(decode_unicode=True):
-                if not raw_line:
-                    continue
+                for raw_line in r.iter_lines(decode_unicode=True):
+                    if not raw_line:
+                        continue
 
-                line = raw_line.strip()
-                if not line.startswith("data: "):
-                    continue
+                    line = raw_line.strip()
+                    if not line.startswith("data: "):
+                        # Some TensorRT-LLM completion responses are normal JSON even
+                        # when stream=True is requested. Keep them and parse after loop.
+                        non_sse_lines.append(line)
+                        continue
 
-                data = line[len("data: ") :]
-                if data == "[DONE]":
-                    break
+                    saw_sse = True
+                    data = line[len("data: ") :]
+                    if data == "[DONE]":
+                        break
 
-                try:
-                    obj = json.loads(data)
-                except Exception:
-                    continue
+                    try:
+                        obj = json.loads(data)
+                    except Exception:
+                        continue
 
-                if "usage" in obj and obj["usage"]:
-                    completion_tokens = obj["usage"].get("completion_tokens", completion_tokens)
-                    prompt_tokens_reported = obj["usage"].get("prompt_tokens", prompt_tokens_reported)
-
-                choices = obj.get("choices", [])
-                if choices:
-                    content = ""
-                    if api_mode == "completion":
-                        content = choices[0].get("text", "") or ""
-                    else:
-                        delta = choices[0].get("delta", {})
-                        content = delta.get("content", "") or ""
-                    if content:
+                    chunk_text, c_toks, p_toks = _extract_text_and_usage_from_response(obj, api_mode)
+                    if c_toks is not None:
+                        completion_tokens = c_toks
+                    if p_toks is not None:
+                        prompt_tokens_reported = p_toks
+                    if chunk_text:
                         if first_token_time is None:
                             first_token_time = time.perf_counter()
                             _debug_print(
                                 f"[request {request_id}] First token after "
                                 f"{first_token_time - start:.2f}s"
                             )
-                        output_text += content
+                        output_text += chunk_text
 
-            end = time.perf_counter()
+                end = time.perf_counter()
+
+            # Normal JSON fallback for /v1/completions when no SSE data arrived.
+            if not output_text and non_sse_lines:
+                raw = "\n".join(non_sse_lines).strip()
+                try:
+                    obj = json.loads(raw)
+                    chunk_text, c_toks, p_toks = _extract_text_and_usage_from_response(obj, api_mode)
+                    output_text += chunk_text
+                    if c_toks is not None:
+                        completion_tokens = c_toks
+                    if p_toks is not None:
+                        prompt_tokens_reported = p_toks
+                    if output_text and first_token_time is None:
+                        # This is a full-response fallback, so true TTFT is unavailable.
+                        # We use full response latency as an upper bound rather than leaving
+                        # TTFT blank, and the report should label completion-mode TTFT this way.
+                        first_token_time = end
+                        _debug_print(
+                            f"[request {request_id}] Parsed non-SSE JSON response; "
+                            f"TTFT is recorded as full-response upper bound."
+                        )
+                except Exception as parse_exc:
+                    _debug_print(f"[request {request_id}] Could not parse non-SSE response as JSON: {parse_exc!r}")
 
     except Exception as e:
         end = time.perf_counter()
@@ -325,9 +408,14 @@ def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s, 
 
     total_time_s = max((end or time.perf_counter()) - start, 1e-9)
 
-    # If server does not return usage in streaming mode, use a rough fallback.
+    tokenizer_path = os.environ.get("TOKENIZER_PATH") or os.environ.get("PLAN_MODEL") or os.environ.get("MODEL_PATH")
     if completion_tokens is None:
-        completion_tokens = max(1, len(output_text.split())) if output_text else 0
+        completion_tokens = _count_output_tokens_fallback(output_text, tokenizer_path)
+
+    # A benchmark request that returns no generated tokens is not a useful pass.
+    # This catches parser mismatches and silent empty completions.
+    if error is None and max_tokens > 0 and completion_tokens == 0:
+        error = "no_output_tokens_returned_or_parsed"
 
     tps = completion_tokens / total_time_s if total_time_s > 0 else 0.0
 
@@ -345,7 +433,6 @@ def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s, 
         "tps": tps,
         "output_chars": len(output_text),
     }
-
 
 def percentile(values, q):
     if not values:

@@ -157,7 +157,7 @@ cuda_graph_config:
 EOF_CONFIG
 }
 
-run_stage() {
+run_stage_once() {
   local STAGE_NAME="$1"
   local SERVER_SEQ_LEN="$2"
   local SERVER_NUM_TOKENS="$3"
@@ -226,8 +226,12 @@ run_stage() {
     REASON="$(classify_server_failure "$STAGE_LOG")"
     echo "WARNING: Stage ${STAGE_NAME} server did not become healthy. Reason: ${REASON}. Recording failure rows and continuing."
     SERVER_LOG="$STAGE_LOG" bash scripts/diagnose_server.sh || true
-    append_stage_failure_rows "$CONTEXTS" "$CONCURRENCIES" "$REASON" "$STAGE_MAX_NEW_TOKENS" "$STAGE_NUM_REQUESTS"
     bash scripts/stop_trtllm_server.sh || true
+    if [[ "${SUPPRESS_STAGE_FAILURE_ROWS:-0}" == "1" ]]; then
+      echo "Suppressed failure row for retry attempt: ${REASON}"
+      return 20
+    fi
+    append_stage_failure_rows "$CONTEXTS" "$CONCURRENCIES" "$REASON" "$STAGE_MAX_NEW_TOKENS" "$STAGE_NUM_REQUESTS"
     echo "Completed failed stage ${STAGE_NAME}."
     return 0
   fi
@@ -238,10 +242,38 @@ run_stage() {
       --required-num-tokens "$REQUIRED_TOTAL_TOKENS"; then
     echo "WARNING: Stage ${STAGE_NAME} server limits are insufficient. Recording failure rows and continuing."
     SERVER_LOG="$STAGE_LOG" bash scripts/diagnose_server.sh || true
-    append_stage_failure_rows "$CONTEXTS" "$CONCURRENCIES" "server_limits_insufficient_required_${REQUIRED_TOTAL_TOKENS}" "$STAGE_MAX_NEW_TOKENS" "$STAGE_NUM_REQUESTS"
     bash scripts/stop_trtllm_server.sh || true
+    if [[ "${SUPPRESS_STAGE_FAILURE_ROWS:-0}" == "1" ]]; then
+      echo "Suppressed failure row for retry attempt: server_limits_insufficient_required_${REQUIRED_TOTAL_TOKENS}"
+      return 21
+    fi
+    append_stage_failure_rows "$CONTEXTS" "$CONCURRENCIES" "server_limits_insufficient_required_${REQUIRED_TOTAL_TOKENS}" "$STAGE_MAX_NEW_TOKENS" "$STAGE_NUM_REQUESTS"
     echo "Completed failed stage ${STAGE_NAME}."
     return 0
+  fi
+
+  # Validate actual KV-cache window from TensorRT-LLM logs before sending long-context requests.
+  # This avoids the failure mode where the server starts but can only allocate a ~33K KV
+  # window for a 64K/128K prompt, causing a request to be accepted with HTTP 200 but never
+  # make GPU compute progress.
+  if [[ "${REQUIRE_KV_WINDOW_CHECK:-0}" == "1" || "$STAGE_NAME" == long_* ]]; then
+    if grep -q "window size=" "$STAGE_LOG"; then
+      if ! "$PYTHON_BIN" scripts/check_kv_window.py           --log "$STAGE_LOG"           --required-tokens "$REQUIRED_TOTAL_TOKENS"; then
+        local REASON="kv_cache_window_too_small_required_${REQUIRED_TOTAL_TOKENS}"
+        echo "WARNING: Stage ${STAGE_NAME} KV-cache window is insufficient. Recording failure rows and continuing."
+        SERVER_LOG="$STAGE_LOG" bash scripts/diagnose_server.sh || true
+        bash scripts/stop_trtllm_server.sh || true
+        if [[ "${SUPPRESS_STAGE_FAILURE_ROWS:-0}" == "1" ]]; then
+          echo "Suppressed failure row for retry attempt: ${REASON}"
+          return 22
+        fi
+        append_stage_failure_rows "$CONTEXTS" "$CONCURRENCIES" "$REASON" "$STAGE_MAX_NEW_TOKENS" "$STAGE_NUM_REQUESTS"
+        echo "Completed failed stage ${STAGE_NAME}."
+        return 0
+      fi
+    else
+      echo "WARNING: No KV-cache window size found in ${STAGE_LOG}; proceeding, but diagnostics may be less precise."
+    fi
   fi
 
   curl --max-time 10 --connect-timeout 2 -sS "http://localhost:${PORT}/v1/models" \
@@ -286,6 +318,88 @@ run_stage() {
   echo "Completed stage ${STAGE_NAME}."
 }
 
+
+
+# Wrapper around run_stage_once. For the 128K assignment case, a single KV-cache
+# fraction is risky: too large can OOM during TensorRT-LLM executor creation,
+# while too small can start but allocate a KV window smaller than the 128K prompt.
+# Therefore long_128k may pass a space-separated KV ladder, e.g.
+#   "0.75 0.70 0.65 0.60 0.55 0.50 0.45"
+# The wrapper tries higher KV reservations first, validates the actual KV window
+# from the server log, and records one clean failure row only after all attempts fail.
+run_stage() {
+  local STAGE_NAME="$1"
+  local SERVER_SEQ_LEN="$2"
+  local SERVER_NUM_TOKENS="$3"
+  local CONTEXTS="$4"
+  local CONCURRENCIES="$5"
+  local MAX_BATCH_SIZE_STAGE="$6"
+  local CUDA_BATCHES="$7"
+  local KV_FRAC_ARG="$8"
+  local ENABLE_CHUNKED_PREFILL_STAGE="$9"
+  local STAGE_NUM_REQUESTS="${10:-$NUM_REQUESTS}"
+  local STAGE_MAX_NEW_TOKENS="${11:-$MAX_NEW_TOKENS}"
+
+  # Only long_128k uses the retry ladder by default. Other stages should keep
+  # their tuned KV values so repeated successful 1K/8K/32K/64K runs remain stable.
+  if [[ "$STAGE_NAME" == "long_128k" && "$KV_FRAC_ARG" == *" "* ]]; then
+    local FINAL_REASON="server_start_failed_oom_all_kv_attempts"
+    local KV_ATTEMPT
+    echo "============================================================"
+    echo "128K KV retry ladder enabled: ${KV_FRAC_ARG}"
+    echo "The runner will only send the 128K request if the server log shows"
+    echo "a KV-cache window >= context + max_new_tokens + safety tokens."
+    echo "============================================================"
+
+    for KV_ATTEMPT in $KV_FRAC_ARG; do
+      echo "============================================================"
+      echo "Trying 128K stage with KV memory fraction: ${KV_ATTEMPT}"
+      echo "============================================================"
+      # Do not append CSV failure rows for intermediate attempts. run_stage_once
+      # will return a non-zero code for server startup/limit/KV-window failures.
+      if SUPPRESS_STAGE_FAILURE_ROWS=1 REQUIRE_KV_WINDOW_CHECK=1 run_stage_once \
+          "$STAGE_NAME" "$SERVER_SEQ_LEN" "$SERVER_NUM_TOKENS" "$CONTEXTS" "$CONCURRENCIES" \
+          "$MAX_BATCH_SIZE_STAGE" "$CUDA_BATCHES" "$KV_ATTEMPT" "$ENABLE_CHUNKED_PREFILL_STAGE" \
+          "${10:-$NUM_REQUESTS}" "${11:-$MAX_NEW_TOKENS}" "${12:-${FIRST_TOKEN_TIMEOUT_S:-$TIMEOUT_S}}" "${13:-${OPENAI_API_MODE:-chat}}"; then
+        echo "128K stage completed using KV memory fraction ${KV_ATTEMPT}."
+        return 0
+      fi
+
+      local ATTEMPT_LOG="${LOG_DIR}/server_${STAGE_NAME}.log"
+      FINAL_REASON="$(classify_server_failure "$ATTEMPT_LOG")"
+      if [[ -f "$ATTEMPT_LOG" ]]; then
+        if grep -qiE "kv_cache_window_too_small|window size=.*required|FAIL: KV-cache window too small" "$ATTEMPT_LOG"; then
+          FINAL_REASON="kv_cache_window_too_small_after_successful_start_required_${SERVER_NUM_TOKENS}"
+          # Lower KV fractions will not increase the KV window, so stop trying.
+          break
+        fi
+        # If the log shows a too-small window, lower fractions cannot help.
+        local WINDOW_LINE
+        WINDOW_LINE=$(grep -E "window size=[0-9]+" "$ATTEMPT_LOG" | tail -1 || true)
+        if [[ -n "$WINDOW_LINE" ]]; then
+          local WINDOW
+          WINDOW=$(echo "$WINDOW_LINE" | sed -E 's/.*window size=([0-9]+).*/\1/')
+          local REQUIRED=$(( $(echo "$CONTEXTS" | awk '{print $1}') + STAGE_MAX_NEW_TOKENS + SAFETY_TOKENS ))
+          if [[ "$WINDOW" =~ ^[0-9]+$ ]] && (( WINDOW < REQUIRED )); then
+            FINAL_REASON="kv_cache_window_too_small_window_${WINDOW}_required_${REQUIRED}"
+            break
+          fi
+        fi
+      fi
+      echo "128K attempt with KV=${KV_ATTEMPT} did not complete. Reason so far: ${FINAL_REASON}. Trying next value if available."
+    done
+
+    echo "WARNING: All 128K KV retry attempts failed. Final reason: ${FINAL_REASON}. Recording one failure row."
+    SERVER_LOG="${LOG_DIR}/server_${STAGE_NAME}.log" bash scripts/diagnose_server.sh || true
+    append_stage_failure_rows "$CONTEXTS" "$CONCURRENCIES" "$FINAL_REASON" "$STAGE_MAX_NEW_TOKENS" "$STAGE_NUM_REQUESTS"
+    bash scripts/stop_trtllm_server.sh || true
+    echo "Completed failed stage ${STAGE_NAME}."
+    return 0
+  fi
+
+  run_stage_once "$@"
+}
+
 # Stage sizing notes:
 # - context_len below is the assignment scenario and is not reduced.
 # - server seq/token caps are internal TensorRT-LLM capacity knobs.
@@ -303,21 +417,23 @@ else
   MED_SEQ="${MED_SEQ:-16384}";           MED_TOK="${MED_TOK:-65536}"
   LONG32_SEQ="${LONG32_SEQ:-49152}";     LONG32_TOK="${LONG32_TOK:-49152}"
   LONG64_SEQ="${LONG64_SEQ:-81920}";     LONG64_TOK="${LONG64_TOK:-81920}"
-  LONG128_SEQ="${LONG128_SEQ:-147456}";  LONG128_TOK="${LONG128_TOK:-147456}"
+  LONG128_SEQ="${LONG128_SEQ:-132352}";  LONG128_TOK="${LONG128_TOK:-132352}"
 fi
 
 SHORT_KV="${SHORT_KV:-0.70}"
 MED_KV="${MED_KV:-0.60}"
 LONG32_KV="${LONG32_KV:-0.30}"
 LONG64_KV="${LONG64_KV:-0.45}"
-LONG128_KV="${LONG128_KV:-0.75}"
+LONG128_KV_LADDER="${LONG128_KV_LADDER:-0.75 0.70 0.65 0.60 0.55 0.50 0.45}"
+LONG128_KV="${LONG128_KV:-$LONG128_KV_LADDER}"
 
 # KV cache sizing note:
 # Earlier 64k runs with LONG64_KV=0.18 initialized but only allocated a KV window
 # around 33k tokens, causing default_max_tokens < 0 and a no-progress stall.
 # These defaults reserve enough KV cache for the assignment long-context prompts.
-# If a stage OOMs at server initialization, reduce only that stage's KV fraction and
-# record the OOM as a runtime-stability/scalability limit.
+# For 128K, the runner uses a KV retry ladder and validates the actual KV-cache
+# window before sending the request. If high KV fractions OOM and lower fractions
+# produce a too-small KV window, the script records a clean scalability-limit row.
 
 SHORT_BATCH="${SHORT_BATCH:-8}"
 MED_BATCH="${MED_BATCH:-4}"
@@ -350,7 +466,9 @@ SHORT_MAX_NEW_TOKENS="${SHORT_MAX_NEW_TOKENS:-256}"
 MED_MAX_NEW_TOKENS="${MED_MAX_NEW_TOKENS:-256}"
 LONG32_MAX_NEW_TOKENS="${LONG32_MAX_NEW_TOKENS:-128}"
 LONG64_MAX_NEW_TOKENS="${LONG64_MAX_NEW_TOKENS:-64}"
-LONG128_MAX_NEW_TOKENS="${LONG128_MAX_NEW_TOKENS:-32}"
+# 128k uses the minimum viable generation budget to test the assignment context
+# while avoiding extra executor/KV-estimation memory. Increase manually only if it starts cleanly.
+LONG128_MAX_NEW_TOKENS="${LONG128_MAX_NEW_TOKENS:-1}"
 
 SHORT_API_MODE="${SHORT_API_MODE:-chat}"
 MED_API_MODE="${MED_API_MODE:-chat}"
