@@ -551,3 +551,14 @@ grep -nE "max_input_len|max_seq_len|max_num_tokens" results/runtime_configs/conf
 ```
 
 Expected 64K benchmark printout should include `MAX_NEW_TOKENS=64` and `NUM_REQUESTS=1`.
+
+
+## Long-context note: chunked prefill
+
+For the final Qwen3-Coder-480B NVFP4 assignment runner, long-context stages use `LONG_CHUNKED_PREFILL=false` by default. In our TensorRT-LLM 1.1.0 PyTorch-backend tests, enabling chunked prefill for the 64K stage allowed the server to return HTTP 200 but then stalled before first token with a warning like:
+
+```text
+default_max_tokens (...) = max_seq_len (~33056) - splited_prompt_len (~64519)
+```
+
+This indicates an internal chunked-prefill/scheduler limit around the 32K range, even though top-level `max_input_len`, `max_seq_len`, and `max_num_tokens` are configured correctly. To keep assignment context lengths unchanged while avoiding that stall, the runner disables chunked prefill for long-context stages by default. You can override with `LONG_CHUNKED_PREFILL=true` for experiments.

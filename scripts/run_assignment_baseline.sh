@@ -18,7 +18,7 @@ source "$(dirname "$0")/common_env.sh"
 #      smaller max_batch_size, smaller CUDA graph batch_sizes, lower KV reservation.
 #   4. Long-context stages use fewer repeated requests/output tokens so the benchmark
 #      does not appear stuck on 64k/128k prefill/generation.
-#   5. Long-context stages enable chunked prefill by default to avoid monolithic prefill behavior.
+#   5. Long-context stages disable chunked prefill by default because TensorRT-LLM 1.1.0 PyTorch backend can stall around 64k prompts in the chunked-prefill path.
 
 MODEL_PATH="${MODEL_PATH:-$FINAL_MODEL_PATH}"
 MODEL_NAME="${MODEL_NAME:-Qwen3-Coder-480B-A35B-Instruct-NVFP4}"
@@ -88,8 +88,8 @@ classify_server_failure() {
     echo "server_start_failed_oom"
   elif grep -qiE "Please don't set both cuda_graph_config.batch_sizes and cuda_graph_config.max_batch_size" "$LOG_FILE"; then
     echo "server_start_failed_bad_cuda_graph_config"
-  elif grep -qiE "max_num_tokens|should not exceed|max_seq_len|max_input_len" "$LOG_FILE"; then
-    echo "server_start_failed_token_limit"
+  elif grep -qiE "default_max_tokens|splited_prompt_len|max_num_tokens|should not exceed|max_seq_len|max_input_len" "$LOG_FILE"; then
+    echo "server_failed_or_stalled_token_limit"
   elif grep -qiE "Traceback|RuntimeError|ValueError" "$LOG_FILE"; then
     echo "server_start_failed_runtime_error"
   else
@@ -316,7 +316,9 @@ LONG_CUDA_BATCHES="${LONG_CUDA_BATCHES:-1}"
 
 SHORT_CHUNKED_PREFILL="${SHORT_CHUNKED_PREFILL:-false}"
 MED_CHUNKED_PREFILL="${MED_CHUNKED_PREFILL:-false}"
-LONG_CHUNKED_PREFILL="${LONG_CHUNKED_PREFILL:-true}"
+LONG_CHUNKED_PREFILL="${LONG_CHUNKED_PREFILL:-false}"
+# Set LONG_CHUNKED_PREFILL=true only for experiments; for Qwen3-Coder-480B NVFP4 on TRT-LLM 1.1.0,
+# chunked prefill can accept a 64k request but stall with default_max_tokens < 0.
 
 LONG32_CONCURRENCIES="1"
 if [[ "$INCLUDE_32K_CONCURRENCY2" == "1" ]]; then
