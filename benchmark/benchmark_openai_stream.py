@@ -214,18 +214,22 @@ def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s, 
             "stream": True,
         }
     else:
-        # Keep both fields for compatibility across OpenAI-compatible servers.
-        # TensorRT-LLM 1.1.0 chat can otherwise fall back to a bad default token
-        # calculation for very long prompts.
+        # TensorRT-LLM 1.1.0's OpenAI chat endpoint rejects some newer
+        # OpenAI request fields. In particular, max_completion_tokens can cause
+        # an immediate HTTP 400 on otherwise valid 1k/8k requests. Therefore
+        # the default chat payload uses only max_tokens. If a newer server needs
+        # max_completion_tokens, enable it explicitly with
+        # INCLUDE_MAX_COMPLETION_TOKENS=1.
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
-            "max_completion_tokens": max_tokens,
             "temperature": 0,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        if os.environ.get("INCLUDE_MAX_COMPLETION_TOKENS", "0") == "1":
+            payload["max_completion_tokens"] = max_tokens
 
     start = time.perf_counter()
     first_token_time = None
@@ -246,6 +250,26 @@ def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s, 
         with requests.post(url, json=payload, stream=True, timeout=(connect_timeout_s, read_timeout_s)) as r:
             status_code = r.status_code
             _debug_print(f"[request {request_id}] HTTP status={status_code}; waiting for stream tokens...")
+            if status_code >= 400:
+                try:
+                    body = r.text[:2000]
+                except Exception as body_exc:
+                    body = f"<could not read response body: {body_exc!r}>"
+                _debug_print(f"[request {request_id}] HTTP error body: {body}")
+                error = f"HTTPError({status_code}): {body}"
+                end = time.perf_counter()
+                return {
+                    "request_id": request_id,
+                    "success": False,
+                    "ttft_ms": None,
+                    "tps": None,
+                    "output_tokens": 0,
+                    "latency_s": end - start,
+                    "error": error,
+                    "target_prompt_tokens": target_prompt_tokens,
+                    "prompt_tokens_est": prompt_tokens_est,
+                    "prompt_tokens_reported": prompt_tokens_reported,
+                }
             r.raise_for_status()
 
             for raw_line in r.iter_lines(decode_unicode=True):

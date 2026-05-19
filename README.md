@@ -582,3 +582,6 @@ The benchmark payload also includes both `max_tokens` and `max_completion_tokens
 Long-context OpenAI/trtllm-serve stages use context-aware KV-cache reservations. A previous 64K run with `LONG64_KV=0.18` initialized the model but only allocated a KV-cache window of about 33K tokens, which caused `default_max_tokens < 0` and a no-progress stall after HTTP 200. The assignment runner now defaults to `LONG64_KV=0.45` and `LONG128_KV=0.75` and includes log-based detection for `window size=...` and negative `default_max_tokens` warnings.
 
 If 64K or 128K OOMs at server initialization, reduce only that stage's KV fraction and report the result as a runtime-stability/scalability limit. Do not reduce the assignment context length.
+
+### Note on HTTP 400 from chat endpoint
+TensorRT-LLM 1.1.0 may reject `max_completion_tokens` on `/v1/chat/completions` with HTTP 400. The benchmark now sends only `max_tokens` by default for chat mode. To test a newer server that requires `max_completion_tokens`, set `INCLUDE_MAX_COMPLETION_TOKENS=1`.
