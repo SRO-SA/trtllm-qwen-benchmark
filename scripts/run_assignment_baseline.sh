@@ -19,6 +19,9 @@ source "$(dirname "$0")/common_env.sh"
 #   4. Long-context stages use fewer repeated requests/output tokens so the benchmark
 #      does not appear stuck on 64k/128k prefill/generation.
 #   5. Long-context stages disable chunked prefill by default because TensorRT-LLM 1.1.0 PyTorch backend can stall around 64k prompts in the chunked-prefill path.
+#   6. 64k/128k stages use /v1/completions by default because the chat endpoint can
+#      compute a bad default_max_tokens for very long prompts even when server limits
+#      are configured correctly.
 
 MODEL_PATH="${MODEL_PATH:-$FINAL_MODEL_PATH}"
 MODEL_NAME="${MODEL_NAME:-Qwen3-Coder-480B-A35B-Instruct-NVFP4}"
@@ -167,6 +170,7 @@ run_stage() {
   local STAGE_NUM_REQUESTS="${10:-$NUM_REQUESTS}"
   local STAGE_MAX_NEW_TOKENS="${11:-$MAX_NEW_TOKENS}"
   local STAGE_FIRST_TOKEN_TIMEOUT_S="${12:-${FIRST_TOKEN_TIMEOUT_S:-$TIMEOUT_S}}"
+  local STAGE_OPENAI_API_MODE="${13:-${OPENAI_API_MODE:-chat}}"
 
   local STAGE_OUT_PLAN="results/plan_assignment_${STAGE_NAME}.json"
   local STAGE_LOG="${LOG_DIR}/server_${STAGE_NAME}.log"
@@ -188,6 +192,7 @@ run_stage() {
   echo "Stage max new tokens: ${STAGE_MAX_NEW_TOKENS}"
   echo "Stage num requests: ${STAGE_NUM_REQUESTS}"
   echo "First-token/read timeout: ${STAGE_FIRST_TOKEN_TIMEOUT_S}"
+  echo "OpenAI API mode: ${STAGE_OPENAI_API_MODE}"
   echo "Server max seq len: ${SERVER_SEQ_LEN}"
   echo "Server max num tokens: ${SERVER_NUM_TOKENS}"
   echo "Required total tokens: ${REQUIRED_TOTAL_TOKENS}"
@@ -262,6 +267,7 @@ run_stage() {
   TIMEOUT_S="$TIMEOUT_S" \
   FIRST_TOKEN_TIMEOUT_S="$STAGE_FIRST_TOKEN_TIMEOUT_S" \
   REQUEST_READ_TIMEOUT_S="$STAGE_FIRST_TOKEN_TIMEOUT_S" \
+  OPENAI_API_MODE="$STAGE_OPENAI_API_MODE" \
   CASE_TIMEOUT_S="$CASE_TIMEOUT_S" \
   SERVER_LOG="$STAGE_LOG" \
   PLAN_OUT="$STAGE_OUT_PLAN" \
@@ -339,11 +345,17 @@ LONG32_MAX_NEW_TOKENS="${LONG32_MAX_NEW_TOKENS:-128}"
 LONG64_MAX_NEW_TOKENS="${LONG64_MAX_NEW_TOKENS:-64}"
 LONG128_MAX_NEW_TOKENS="${LONG128_MAX_NEW_TOKENS:-32}"
 
-run_stage "short_1k_multiuser" "$SHORT_SEQ" "$SHORT_TOK" "1024" "1 2 4 8" "$SHORT_BATCH" "$SHORT_CUDA_BATCHES" "$SHORT_KV" "$SHORT_CHUNKED_PREFILL" "$SHORT_NUM_REQUESTS" "$SHORT_MAX_NEW_TOKENS"
-run_stage "medium_8k_multiuser" "$MED_SEQ" "$MED_TOK" "8192" "1 2 4" "$MED_BATCH" "$MED_CUDA_BATCHES" "$MED_KV" "$MED_CHUNKED_PREFILL" "$MED_NUM_REQUESTS" "$MED_MAX_NEW_TOKENS"
-run_stage "long_32k" "$LONG32_SEQ" "$LONG32_TOK" "32768" "$LONG32_CONCURRENCIES" "$LONG_BATCH" "$LONG_CUDA_BATCHES" "$LONG32_KV" "$LONG_CHUNKED_PREFILL" "$LONG32_NUM_REQUESTS" "$LONG32_MAX_NEW_TOKENS" "${LONG32_FIRST_TOKEN_TIMEOUT_S:-900}"
-run_stage "long_64k" "$LONG64_SEQ" "$LONG64_TOK" "65536" "1" "$LONG_BATCH" "$LONG_CUDA_BATCHES" "$LONG64_KV" "$LONG_CHUNKED_PREFILL" "$LONG64_NUM_REQUESTS" "$LONG64_MAX_NEW_TOKENS" "${LONG64_FIRST_TOKEN_TIMEOUT_S:-900}"
-run_stage "long_128k" "$LONG128_SEQ" "$LONG128_TOK" "131072" "1" "$LONG_BATCH" "$LONG_CUDA_BATCHES" "$LONG128_KV" "$LONG_CHUNKED_PREFILL" "$LONG128_NUM_REQUESTS" "$LONG128_MAX_NEW_TOKENS" "${LONG128_FIRST_TOKEN_TIMEOUT_S:-1200}"
+SHORT_API_MODE="${SHORT_API_MODE:-chat}"
+MED_API_MODE="${MED_API_MODE:-chat}"
+LONG32_API_MODE="${LONG32_API_MODE:-chat}"
+LONG64_API_MODE="${LONG64_API_MODE:-completion}"
+LONG128_API_MODE="${LONG128_API_MODE:-completion}"
+
+run_stage "short_1k_multiuser" "$SHORT_SEQ" "$SHORT_TOK" "1024" "1 2 4 8" "$SHORT_BATCH" "$SHORT_CUDA_BATCHES" "$SHORT_KV" "$SHORT_CHUNKED_PREFILL" "$SHORT_NUM_REQUESTS" "$SHORT_MAX_NEW_TOKENS" "${SHORT_FIRST_TOKEN_TIMEOUT_S:-$TIMEOUT_S}" "$SHORT_API_MODE"
+run_stage "medium_8k_multiuser" "$MED_SEQ" "$MED_TOK" "8192" "1 2 4" "$MED_BATCH" "$MED_CUDA_BATCHES" "$MED_KV" "$MED_CHUNKED_PREFILL" "$MED_NUM_REQUESTS" "$MED_MAX_NEW_TOKENS" "${MED_FIRST_TOKEN_TIMEOUT_S:-$TIMEOUT_S}" "$MED_API_MODE"
+run_stage "long_32k" "$LONG32_SEQ" "$LONG32_TOK" "32768" "$LONG32_CONCURRENCIES" "$LONG_BATCH" "$LONG_CUDA_BATCHES" "$LONG32_KV" "$LONG_CHUNKED_PREFILL" "$LONG32_NUM_REQUESTS" "$LONG32_MAX_NEW_TOKENS" "${LONG32_FIRST_TOKEN_TIMEOUT_S:-900}" "$LONG32_API_MODE"
+run_stage "long_64k" "$LONG64_SEQ" "$LONG64_TOK" "65536" "1" "$LONG_BATCH" "$LONG_CUDA_BATCHES" "$LONG64_KV" "$LONG_CHUNKED_PREFILL" "$LONG64_NUM_REQUESTS" "$LONG64_MAX_NEW_TOKENS" "${LONG64_FIRST_TOKEN_TIMEOUT_S:-900}" "$LONG64_API_MODE"
+run_stage "long_128k" "$LONG128_SEQ" "$LONG128_TOK" "131072" "1" "$LONG_BATCH" "$LONG_CUDA_BATCHES" "$LONG128_KV" "$LONG_CHUNKED_PREFILL" "$LONG128_NUM_REQUESTS" "$LONG128_MAX_NEW_TOKENS" "${LONG128_FIRST_TOKEN_TIMEOUT_S:-1200}" "$LONG128_API_MODE"
 
 echo "============================================================"
 echo "Assignment baseline benchmark complete."

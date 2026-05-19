@@ -155,7 +155,7 @@ def make_prompt(context_len: int) -> Tuple[str, int, int]:
     return prompt, len(ids), target_prompt_tokens
 
 
-def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s):
+def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s, api_mode):
     prompt_build_start = time.perf_counter()
     _debug_print(f"[request {request_id}] Building prompt for context={context_len}...")
     prompt, prompt_tokens_est, target_prompt_tokens = make_prompt(context_len)
@@ -165,14 +165,34 @@ def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s):
         f"target_prompt_tokens={target_prompt_tokens}, "
         f"prompt_tokens_est={prompt_tokens_est}, prompt_chars={len(prompt)}"
     )
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens,
-        "temperature": 0,
-        "stream": True,
-        "stream_options": {"include_usage": True},
-    }
+    api_mode = (api_mode or "chat").strip().lower()
+    if api_mode == "completions":
+        api_mode = "completion"
+
+    if api_mode == "completion":
+        # /v1/completions maps max_tokens directly to generated tokens in many
+        # OpenAI-compatible servers. We use this for very long prompts when the
+        # chat endpoint may compute an invalid default_max_tokens internally.
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": 0,
+            "stream": True,
+        }
+    else:
+        # Keep both fields for compatibility across OpenAI-compatible servers.
+        # TensorRT-LLM 1.1.0 chat can otherwise fall back to a bad default token
+        # calculation for very long prompts.
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "max_completion_tokens": max_tokens,
+            "temperature": 0,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
 
     start = time.perf_counter()
     first_token_time = None
@@ -187,7 +207,7 @@ def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s):
         connect_timeout_s = float(os.environ.get("REQUEST_CONNECT_TIMEOUT_S", "10"))
         read_timeout_s = float(os.environ.get("REQUEST_READ_TIMEOUT_S", os.environ.get("FIRST_TOKEN_TIMEOUT_S", str(timeout_s))))
         _debug_print(
-            f"[request {request_id}] Sending request to server "
+            f"[request {request_id}] Sending {api_mode} request to server "
             f"(connect_timeout={connect_timeout_s}s, read_timeout={read_timeout_s}s)..."
         )
         with requests.post(url, json=payload, stream=True, timeout=(connect_timeout_s, read_timeout_s)) as r:
@@ -218,8 +238,12 @@ def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s):
 
                 choices = obj.get("choices", [])
                 if choices:
-                    delta = choices[0].get("delta", {})
-                    content = delta.get("content", "")
+                    content = ""
+                    if api_mode == "completion":
+                        content = choices[0].get("text", "") or ""
+                    else:
+                        delta = choices[0].get("delta", {})
+                        content = delta.get("content", "") or ""
                     if content:
                         if first_token_time is None:
                             first_token_time = time.perf_counter()
@@ -288,9 +312,12 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--timeout-s", type=float, default=600)
     parser.add_argument("--output", default="results/smoke_results.csv")
+    parser.add_argument("--api-mode", default=os.environ.get("OPENAI_API_MODE", "chat"), choices=["chat", "completion", "completions"], help="Use /v1/chat/completions or /v1/completions")
     args = parser.parse_args()
 
-    url = f"http://{args.host}:{args.port}/v1/chat/completions"
+    api_mode = "completion" if args.api_mode == "completions" else args.api_mode
+    endpoint = "completions" if api_mode == "completion" else "chat/completions"
+    url = f"http://{args.host}:{args.port}/v1/{endpoint}"
 
     idle_gpu = gpu_snapshot()
     vram_idle_gb = sum_gpu_mem_gb(idle_gpu)
@@ -301,7 +328,7 @@ def main():
     print(
         f"Starting benchmark requests: context={args.context_len}, "
         f"concurrency={args.concurrency}, num_requests={args.num_requests}, "
-        f"max_tokens={args.max_tokens}, timeout_s={args.timeout_s}",
+        f"max_tokens={args.max_tokens}, timeout_s={args.timeout_s}, api_mode={api_mode}",
         flush=True,
     )
 
@@ -315,6 +342,7 @@ def main():
                 args.max_tokens,
                 i,
                 args.timeout_s,
+                api_mode,
             )
             for i in range(args.num_requests)
         ]

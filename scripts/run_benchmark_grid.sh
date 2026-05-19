@@ -31,6 +31,7 @@ STOP_ON_CASE_FAILURE="${STOP_ON_CASE_FAILURE:-1}"
 SERVER_LOG="${SERVER_LOG:-}"
 PLAN_OUT="${PLAN_OUT:-results/plan_${DECODE_MODE}.json}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-$PLAN_MODEL}"
+OPENAI_API_MODE="${OPENAI_API_MODE:-chat}"
 
 mkdir -p results
 
@@ -41,6 +42,7 @@ export PROMPT_TOKEN_RESERVE
 export FIRST_TOKEN_TIMEOUT_S
 export REQUEST_READ_TIMEOUT_S
 export REQUEST_CONNECT_TIMEOUT_S
+export OPENAI_API_MODE
 
 echo "======================================"
 echo "TensorRT-LLM benchmark grid"
@@ -48,6 +50,7 @@ echo "======================================"
 echo "MODEL_NAME=${MODEL_NAME}"
 echo "PLAN_MODEL=${PLAN_MODEL}"
 echo "TOKENIZER_PATH=${TOKENIZER_PATH}"
+echo "OPENAI_API_MODE=${OPENAI_API_MODE}"
 echo "DECODE_MODE=${DECODE_MODE}"
 echo "QUANTIZATION=${QUANTIZATION}"
 echo "CONTEXTS=${CONTEXTS}"
@@ -107,6 +110,7 @@ while IFS=$'\t' read -r CONTEXT CONCURRENCY EST_TOTAL EST_KV; do
     --num-requests "$NUM_REQUESTS"
     --max-tokens "$MAX_NEW_TOKENS"
     --timeout-s "$TIMEOUT_S"
+    --api-mode "$OPENAI_API_MODE"
     --output "$OUT"
   )
 

@@ -562,3 +562,16 @@ default_max_tokens (...) = max_seq_len (~33056) - splited_prompt_len (~64519)
 ```
 
 This indicates an internal chunked-prefill/scheduler limit around the 32K range, even though top-level `max_input_len`, `max_seq_len`, and `max_num_tokens` are configured correctly. To keep assignment context lengths unchanged while avoiding that stall, the runner disables chunked prefill for long-context stages by default. You can override with `LONG_CHUNKED_PREFILL=true` for experiments.
+
+
+## Long-context endpoint behavior
+
+The assignment runner keeps the required input context lengths unchanged (1k, 8k, 32k, 64k, 128k). For the 64k and 128k stages it uses `OPENAI_API_MODE=completion` by default so the benchmark sends requests to `/v1/completions` instead of `/v1/chat/completions`. This is intentional: on TensorRT-LLM 1.1.0 PyTorch backend, the chat endpoint can accept a very long prompt with HTTP 200 but then compute a negative `default_max_tokens` internally for ~64k prompts, causing the request to wait forever with no GPU compute.
+
+The short, medium, and 32k stages still default to chat mode. You can override these if needed:
+
+```bash
+LONG64_API_MODE=chat LONG128_API_MODE=chat bash scripts/run_assignment_baseline.sh
+```
+
+The benchmark payload also includes both `max_tokens` and `max_completion_tokens` for chat requests for compatibility across OpenAI-compatible servers.
