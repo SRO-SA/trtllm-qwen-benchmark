@@ -5,13 +5,22 @@ import os
 import statistics
 import subprocess
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from typing import Optional, Tuple
 
 import requests
 
 _TOKENIZER = None
 _TOKENIZER_PATH = None
+
+
+def _env_flag(name: str, default: str = "1") -> bool:
+    return os.environ.get(name, default).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _debug_print(msg: str) -> None:
+    if _env_flag("DEBUG_BENCHMARK_REQUESTS", "1"):
+        print(msg, flush=True)
 
 
 def gpu_snapshot():
@@ -147,7 +156,15 @@ def make_prompt(context_len: int) -> Tuple[str, int, int]:
 
 
 def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s):
+    prompt_build_start = time.perf_counter()
+    _debug_print(f"[request {request_id}] Building prompt for context={context_len}...")
     prompt, prompt_tokens_est, target_prompt_tokens = make_prompt(context_len)
+    prompt_build_s = time.perf_counter() - prompt_build_start
+    _debug_print(
+        f"[request {request_id}] Prompt built in {prompt_build_s:.2f}s: "
+        f"target_prompt_tokens={target_prompt_tokens}, "
+        f"prompt_tokens_est={prompt_tokens_est}, prompt_chars={len(prompt)}"
+    )
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
@@ -167,8 +184,10 @@ def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s):
     status_code = None
 
     try:
+        _debug_print(f"[request {request_id}] Sending request to server...")
         with requests.post(url, json=payload, stream=True, timeout=timeout_s) as r:
             status_code = r.status_code
+            _debug_print(f"[request {request_id}] HTTP status={status_code}; waiting for stream tokens...")
             r.raise_for_status()
 
             for raw_line in r.iter_lines(decode_unicode=True):
@@ -199,6 +218,10 @@ def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s):
                     if content:
                         if first_token_time is None:
                             first_token_time = time.perf_counter()
+                            _debug_print(
+                                f"[request {request_id}] First token after "
+                                f"{first_token_time - start:.2f}s"
+                            )
                         output_text += content
 
             end = time.perf_counter()
@@ -206,6 +229,7 @@ def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s):
     except Exception as e:
         end = time.perf_counter()
         error = repr(e)
+        _debug_print(f"[request {request_id}] Request failed after {end - start:.2f}s: {error}")
 
     ttft_ms = None
     if first_token_time is not None:
@@ -289,19 +313,40 @@ def main():
         ]
 
         completed = 0
-        for fut in as_completed(futures):
-            result = fut.result()
-            results.append(result)
-            completed += 1
-            status = "ok" if result.get("success") else "fail"
-            print(
-                f"Completed request {completed}/{args.num_requests} "
-                f"(id={result.get('request_id')}, status={status}, "
-                f"ttft_ms={result.get('ttft_ms')}, "
-                f"total_time_s={result.get('total_time_s'):.2f}, "
-                f"prompt_tokens={result.get('prompt_tokens_reported') or result.get('prompt_tokens_est')})",
-                flush=True,
-            )
+        pending = set(futures)
+        heartbeat_s = float(os.environ.get("BENCHMARK_HEARTBEAT_S", "60"))
+        last_heartbeat = time.perf_counter()
+
+        while pending:
+            done, pending = wait(pending, timeout=heartbeat_s, return_when=FIRST_COMPLETED)
+
+            if not done:
+                now = time.perf_counter()
+                snap = gpu_snapshot()
+                gpu_util = mean_gpu_util(snap)
+                vram_now = sum_gpu_mem_gb(snap)
+                print(
+                    f"[heartbeat] {len(pending)}/{args.num_requests} requests still running; "
+                    f"elapsed={now - start_wall:.1f}s; "
+                    f"vram_used_total_gb={vram_now:.2f}; gpu_util_mean={gpu_util}",
+                    flush=True,
+                )
+                last_heartbeat = now
+                continue
+
+            for fut in done:
+                result = fut.result()
+                results.append(result)
+                completed += 1
+                status = "ok" if result.get("success") else "fail"
+                print(
+                    f"Completed request {completed}/{args.num_requests} "
+                    f"(id={result.get('request_id')}, status={status}, "
+                    f"ttft_ms={result.get('ttft_ms')}, "
+                    f"total_time_s={result.get('total_time_s'):.2f}, "
+                    f"prompt_tokens={result.get('prompt_tokens_reported') or result.get('prompt_tokens_est')})",
+                    flush=True,
+                )
 
     end_wall = time.perf_counter()
 

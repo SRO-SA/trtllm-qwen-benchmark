@@ -18,6 +18,7 @@ source "$(dirname "$0")/common_env.sh"
 #      smaller max_batch_size, smaller CUDA graph batch_sizes, lower KV reservation.
 #   4. Long-context stages use fewer repeated requests/output tokens so the benchmark
 #      does not appear stuck on 64k/128k prefill/generation.
+#   5. Long-context stages enable chunked prefill by default to avoid monolithic prefill behavior.
 
 MODEL_PATH="${MODEL_PATH:-$FINAL_MODEL_PATH}"
 MODEL_NAME="${MODEL_NAME:-Qwen3-Coder-480B-A35B-Instruct-NVFP4}"
@@ -294,7 +295,7 @@ LONG_CUDA_BATCHES="${LONG_CUDA_BATCHES:-1}"
 
 SHORT_CHUNKED_PREFILL="${SHORT_CHUNKED_PREFILL:-false}"
 MED_CHUNKED_PREFILL="${MED_CHUNKED_PREFILL:-false}"
-LONG_CHUNKED_PREFILL="${LONG_CHUNKED_PREFILL:-false}"
+LONG_CHUNKED_PREFILL="${LONG_CHUNKED_PREFILL:-true}"
 
 LONG32_CONCURRENCIES="1"
 if [[ "$INCLUDE_32K_CONCURRENCY2" == "1" ]]; then
