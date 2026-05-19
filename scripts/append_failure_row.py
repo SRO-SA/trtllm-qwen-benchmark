@@ -40,6 +40,11 @@ def main():
     p.add_argument("--max-tokens", type=int, required=True)
     p.add_argument("--num-requests", type=int, required=True)
     p.add_argument("--error-message", required=True)
+    p.add_argument("--scenario-name", default=os.environ.get("SCENARIO_NAME", "unspecified"))
+    p.add_argument("--workload-type", default=os.environ.get("WORKLOAD_TYPE", "unspecified"))
+    p.add_argument("--prompt-profile", default=os.environ.get("PROMPT_PROFILE", "synthetic_code_context"))
+    p.add_argument("--api-mode", default=os.environ.get("OPENAI_API_MODE", "unknown"))
+    p.add_argument("--duration-s", default=os.environ.get("DURATION_S", "0"))
     args = p.parse_args()
 
     gpus = gpu_snapshot()
@@ -50,6 +55,11 @@ def main():
         gpu_util = sum(utils) / len(utils)
 
     row = {
+        "scenario_name": args.scenario_name,
+        "workload_type": args.workload_type,
+        "prompt_profile": args.prompt_profile,
+        "api_mode": args.api_mode,
+        "duration_s_requested": args.duration_s,
         "framework": args.framework,
         "model": args.model,
         "quantization": args.quantization,

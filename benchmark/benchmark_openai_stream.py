@@ -122,16 +122,48 @@ def _encode_len(tokenizer, text: str) -> int:
     return len(tokenizer.encode(text, add_special_tokens=False))
 
 
+
+def _load_prompt_template(profile: str):
+    """Load a prompt template from data/assignment_prompts.jsonl.
+
+    The JSONL file keeps assignment workload prompts separate from code so the
+    same benchmark engine can run chat, code-generation, sustained-throughput,
+    and long-context scenarios.
+    """
+    prompt_file = os.environ.get("PROMPT_FILE", "data/assignment_prompts.jsonl")
+    fallback = {
+        "prompt_profile": "synthetic_code_context",
+        "workload_type": "long_context",
+        "system_instruction": "You are a coding assistant. Read the following synthetic Python code context. Answer only the final question.",
+        "context_unit": (
+            "def transform_value(x):\n"
+            "    y = x + 1\n"
+            "    z = y * 2\n"
+            "    if z % 3 == 0:\n"
+            "        return z - 1\n"
+            "    return z + 1\n\n"
+        ),
+        "final_instruction": "Question: In one sentence, summarize what transform_value repeatedly does.",
+    }
+    try:
+        with open(prompt_file, errors="ignore") as f:
+            for line in f:
+                line=line.strip()
+                if not line:
+                    continue
+                obj=json.loads(line)
+                if obj.get("prompt_profile") == profile:
+                    return obj
+    except Exception as e:
+        print(f"[WARN] Could not load prompt profile {profile!r} from {prompt_file}: {e!r}", flush=True)
+    return fallback
+
 def make_prompt(context_len: int) -> Tuple[str, int, int]:
-    """Create a synthetic code prompt with tokenizer-aware length control.
+    """Create a tokenizer-aware prompt for the selected assignment workload.
 
-    context_len is the assignment target window (1k, 8k, 32k, 64k, 128k). We
-    create a prompt that is safely below that target, leaving reserve tokens for
-    chat-template overhead and generated output.
-
-    This is important for TensorRT-LLM: the server validates the *tokenized*
-    prompt against max_num_tokens. Character-based estimates can overshoot badly
-    for Qwen/Qwen3-Coder and caused 32k tests to become 52k+ token prompts.
+    Select the prompt via PROMPT_PROFILE and PROMPT_FILE. The prompt is expanded
+    to fit the requested context window while leaving PROMPT_TOKEN_RESERVE tokens
+    for chat-template overhead and generated output.
     """
     tokenizer_path = (
         os.environ.get("TOKENIZER_PATH")
@@ -141,35 +173,28 @@ def make_prompt(context_len: int) -> Tuple[str, int, int]:
     reserve_tokens = int(os.environ.get("PROMPT_TOKEN_RESERVE", "1024"))
     target_prompt_tokens = max(32, int(context_len) - reserve_tokens)
 
-    header = (
-        "You are a coding assistant. Read the following synthetic Python code context. "
-        "Answer only the final question.\n\n"
-    )
-    unit = (
-        "def transform_value(x):\n"
-        "    y = x + 1\n"
-        "    z = y * 2\n"
-        "    if z % 3 == 0:\n"
-        "        return z - 1\n"
-        "    return z + 1\n\n"
-    )
-    footer = "\nQuestion: In one sentence, summarize what transform_value repeatedly does."
+    profile = os.environ.get("PROMPT_PROFILE", "synthetic_code_context")
+    template = _load_prompt_template(profile)
+    header = (template.get("system_instruction") or "You are a helpful assistant.").strip() + "\n\n"
+    unit = template.get("context_unit") or "Synthetic context line for benchmarking.\n"
+    footer = "\n" + (template.get("final_instruction") or "Answer the final question briefly.").strip()
 
     tokenizer = _get_tokenizer(tokenizer_path)
 
     if tokenizer is None:
-        # Conservative fallback: use fewer chars/token than before to avoid huge overshoot.
+        # Conservative fallback: use fewer chars/token to avoid token overrun.
         target_chars = max(1, target_prompt_tokens) * 2
-        body = unit * max(1, target_chars // len(unit))
+        body = unit * max(1, target_chars // max(1, len(unit)))
         prompt = header + body + footer
         return prompt, -1, target_prompt_tokens
 
     fixed = header + footer
     fixed_ids = tokenizer.encode(fixed, add_special_tokens=False)
     unit_ids = tokenizer.encode(unit, add_special_tokens=False)
+    if not unit_ids:
+        unit_ids = tokenizer.encode("Synthetic benchmark context.\n", add_special_tokens=False)
     remaining = max(1, target_prompt_tokens - len(fixed_ids))
 
-    # Build exact-ish body in token space, then decode back to text.
     repeated_ids = []
     while len(repeated_ids) < remaining:
         repeated_ids.extend(unit_ids)
@@ -179,7 +204,6 @@ def make_prompt(context_len: int) -> Tuple[str, int, int]:
     prompt = header + body + footer
     ids = tokenizer.encode(prompt, add_special_tokens=False)
 
-    # Final trim if decode/re-encode produced a slight overrun.
     if len(ids) > target_prompt_tokens:
         ids = ids[:target_prompt_tokens]
         prompt = tokenizer.decode(ids, skip_special_tokens=True)
@@ -557,7 +581,12 @@ def main():
     parser.add_argument("--timeout-s", type=float, default=600)
     parser.add_argument("--output", default="results/smoke_results.csv")
     parser.add_argument("--api-mode", default=os.environ.get("OPENAI_API_MODE", "chat"), choices=["chat", "completion", "completions"], help="Use /v1/chat/completions or /v1/completions")
+    parser.add_argument("--scenario-name", default=os.environ.get("SCENARIO_NAME", "unspecified"))
+    parser.add_argument("--workload-type", default=os.environ.get("WORKLOAD_TYPE", "unspecified"))
+    parser.add_argument("--prompt-profile", default=os.environ.get("PROMPT_PROFILE", "synthetic_code_context"))
+    parser.add_argument("--duration-s", type=float, default=float(os.environ.get("DURATION_S", "0")))
     args = parser.parse_args()
+    os.environ["PROMPT_PROFILE"] = args.prompt_profile
 
     api_mode = "completion" if args.api_mode == "completions" else args.api_mode
     endpoint = "completions" if api_mode == "completion" else "chat/completions"
@@ -572,7 +601,8 @@ def main():
     print(
         f"Starting benchmark requests: context={args.context_len}, "
         f"concurrency={args.concurrency}, num_requests={args.num_requests}, "
-        f"max_tokens={args.max_tokens}, timeout_s={args.timeout_s}, api_mode={api_mode}",
+        f"max_tokens={args.max_tokens}, timeout_s={args.timeout_s}, api_mode={api_mode}, "
+        f"scenario={args.scenario_name}, workload={args.workload_type}, prompt_profile={args.prompt_profile}",
         flush=True,
     )
 
@@ -651,6 +681,11 @@ def main():
     target_prompt_values = [r.get("target_prompt_tokens") for r in results if r.get("target_prompt_tokens") is not None]
 
     row = {
+        "scenario_name": args.scenario_name,
+        "workload_type": args.workload_type,
+        "prompt_profile": args.prompt_profile,
+        "api_mode": api_mode,
+        "duration_s_requested": args.duration_s,
         "framework": args.framework,
         "model": args.model,
         "quantization": args.quantization,

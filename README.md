@@ -621,3 +621,79 @@ STARTUP_NO_PROGRESS_MIN_ELAPSED_S=180
 ## Patch note: long-context completions parsing
 
 For 64K and 128K assignment stages, the runner uses `/v1/completions` rather than `/v1/chat/completions` because the TensorRT-LLM 1.1.0 OpenAI chat wrapper can mis-handle very long prompts. The benchmark now applies the model tokenizer's chat template before sending a completion request, uses non-streaming completions by default for long contexts, and parses both `choices[].text` and chat-like `delta.content`/`message.content` fields. This avoids the earlier `no_output_tokens_returned_or_parsed` false failure when the server completed a long-context request but the benchmark did not extract generated text correctly.
+
+## Full Assignment Scenario Suite
+
+The assignment requires TensorRT-LLM results for Qwen3-Coder-480B NVFP4 on RTX PRO 6000 Blackwell across:
+
+- Single-user inference
+- Multi-user/concurrent inference
+- Long-context evaluation at 32K, 64K, and 128K
+- Concurrent chat sessions
+- Parallel code generation
+- Sustained throughput testing
+
+This patched repo includes prompt templates in:
+
+```bash
+data/assignment_prompts.jsonl
+```
+
+Each benchmark row now records:
+
+```text
+scenario_name, workload_type, prompt_profile, api_mode, duration_s_requested,
+TTFT, TPS mean/P99, VRAM idle/load, KV-cache growth, GPU utilization, runtime stability
+```
+
+### Recommended 8-GPU full run
+
+Use this after the model is downloaded and the repo is set up:
+
+```bash
+cd /workspace/trtllm-qwen-benchmark
+bash scripts/stop_trtllm_server.sh || true
+chmod +x scripts/*.sh
+touch benchmark/__init__.py
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+TP_SIZE=8 \
+LONG128_KV_LADDER="0.65 0.60 0.55" \
+MODEL_PATH=/workspace/models/Qwen3-Coder-480B-A35B-Instruct-NVFP4 \
+MODEL_NAME=Qwen3-Coder-480B-A35B-Instruct-NVFP4 \
+PLAN_MODEL=/workspace/models/Qwen3-Coder-480B-A35B-Instruct-NVFP4 \
+TOKENIZER_PATH=/workspace/models/Qwen3-Coder-480B-A35B-Instruct-NVFP4 \
+QUANTIZATION=nvfp4 \
+PROMPT_TOKEN_RESERVE=1024 \
+PYTORCH_ALLOC_CONF=expandable_segments:True \
+PYTHONPATH=$PWD \
+bash scripts/run_assignment_full_suite.sh
+```
+
+Main outputs:
+
+```bash
+results/assignment_tensorrt_llm_qwen480b_full.csv
+results/assignment_summary.csv
+results/assignment_coverage_summary.csv
+results/max_concurrency_summary.csv
+results/server_logs/
+results/diagnostics/
+```
+
+### 128K-only rerun
+
+If you only need to rerun the 128K long-context case:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+TP_SIZE=8 \
+LONG128_KV_LADDER="0.65 0.60 0.55" \
+MODEL_PATH=/workspace/models/Qwen3-Coder-480B-A35B-Instruct-NVFP4 \
+MODEL_NAME=Qwen3-Coder-480B-A35B-Instruct-NVFP4 \
+PLAN_MODEL=/workspace/models/Qwen3-Coder-480B-A35B-Instruct-NVFP4 \
+TOKENIZER_PATH=/workspace/models/Qwen3-Coder-480B-A35B-Instruct-NVFP4 \
+QUANTIZATION=nvfp4 \
+PYTHONPATH=$PWD \
+bash scripts/run_assignment_128k_only.sh
+```
