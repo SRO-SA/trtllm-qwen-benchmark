@@ -87,7 +87,9 @@ classify_server_failure() {
     return 0
   fi
 
-  if grep -qiE "CUDA out of memory|out of memory|insufficient GPU memory|Executor creation failed due to insufficient GPU memory" "$LOG_FILE"; then
+  if grep -qiE "SERVER_START_HANG_NO_LOG_PROGRESS|startup appears hung|no new log output" "$LOG_FILE"; then
+    echo "server_start_hung_no_log_progress"
+  elif grep -qiE "CUDA out of memory|out of memory|insufficient GPU memory|Executor creation failed due to insufficient GPU memory" "$LOG_FILE"; then
     echo "server_start_failed_oom"
   elif grep -qiE "Please don't set both cuda_graph_config.batch_sizes and cuda_graph_config.max_batch_size" "$LOG_FILE"; then
     echo "server_start_failed_bad_cuda_graph_config"
@@ -171,6 +173,10 @@ run_stage_once() {
   local STAGE_MAX_NEW_TOKENS="${11:-$MAX_NEW_TOKENS}"
   local STAGE_FIRST_TOKEN_TIMEOUT_S="${12:-${FIRST_TOKEN_TIMEOUT_S:-$TIMEOUT_S}}"
   local STAGE_OPENAI_API_MODE="${13:-${OPENAI_API_MODE:-chat}}"
+  local STAGE_STARTUP_NO_PROGRESS_TIMEOUT_S="${STARTUP_NO_PROGRESS_TIMEOUT_S:-600}"
+  if [[ "$STAGE_NAME" == "long_128k" ]]; then
+    STAGE_STARTUP_NO_PROGRESS_TIMEOUT_S="${LONG128_STARTUP_NO_PROGRESS_TIMEOUT_S:-300}"
+  fi
 
   local STAGE_OUT_PLAN="results/plan_assignment_${STAGE_NAME}.json"
   local STAGE_LOG="${LOG_DIR}/server_${STAGE_NAME}.log"
@@ -192,6 +198,7 @@ run_stage_once() {
   echo "Stage max new tokens: ${STAGE_MAX_NEW_TOKENS}"
   echo "Stage num requests: ${STAGE_NUM_REQUESTS}"
   echo "First-token/read timeout: ${STAGE_FIRST_TOKEN_TIMEOUT_S}"
+  echo "Startup no-progress timeout: ${STAGE_STARTUP_NO_PROGRESS_TIMEOUT_S}"
   echo "OpenAI API mode: ${STAGE_OPENAI_API_MODE}"
   echo "Server max seq len: ${SERVER_SEQ_LEN}"
   echo "Server max num tokens: ${SERVER_NUM_TOKENS}"
@@ -221,7 +228,7 @@ run_stage_once() {
   echo $! > server.pid
   echo "Started server PID $(cat server.pid). Log: ${STAGE_LOG}"
 
-  if ! TIMEOUT_S="$WAIT_TIMEOUT_S" SERVER_LOG="$STAGE_LOG" bash scripts/wait_for_server.sh; then
+  if ! TIMEOUT_S="$WAIT_TIMEOUT_S" STARTUP_NO_PROGRESS_TIMEOUT_S="$STAGE_STARTUP_NO_PROGRESS_TIMEOUT_S" SERVER_LOG="$STAGE_LOG" bash scripts/wait_for_server.sh; then
     local REASON
     REASON="$(classify_server_failure "$STAGE_LOG")"
     echo "WARNING: Stage ${STAGE_NAME} server did not become healthy. Reason: ${REASON}. Recording failure rows and continuing."

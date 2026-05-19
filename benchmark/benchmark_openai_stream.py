@@ -188,28 +188,103 @@ def make_prompt(context_len: int) -> Tuple[str, int, int]:
     return prompt, len(ids), target_prompt_tokens
 
 
+
+def apply_chat_template_for_completion(prompt: str) -> Tuple[str, int]:
+    """Optionally wrap a raw user prompt with the model's chat template for /v1/completions.
+
+    TensorRT-LLM's /v1/completions endpoint expects a plain text prompt. For
+    instruct/chat checkpoints such as Qwen3-Coder-Instruct, sending the raw user
+    text can produce an immediate EOS or an empty completion. Using the tokenizer
+    chat template creates the same style of prompt that /v1/chat/completions
+    would normally build internally, while still avoiding the OpenAI chat server
+    path that had long-context issues for 64K.
+    """
+    if not _env_flag("COMPLETION_USE_CHAT_TEMPLATE", "1"):
+        tokenizer_path = os.environ.get("TOKENIZER_PATH") or os.environ.get("PLAN_MODEL") or os.environ.get("MODEL_PATH")
+        tokenizer = _get_tokenizer(tokenizer_path)
+        return prompt, _encode_len(tokenizer, prompt)
+
+    tokenizer_path = os.environ.get("TOKENIZER_PATH") or os.environ.get("PLAN_MODEL") or os.environ.get("MODEL_PATH")
+    tokenizer = _get_tokenizer(tokenizer_path)
+    if tokenizer is None or not hasattr(tokenizer, "apply_chat_template"):
+        return prompt, _encode_len(tokenizer, prompt)
+
+    try:
+        templated = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        return templated, _encode_len(tokenizer, templated)
+    except Exception as e:
+        print(f"[WARN] Failed to apply completion chat template: {repr(e)}")
+        return prompt, _encode_len(tokenizer, prompt)
+
+
 def _extract_text_and_usage_from_response(obj, api_mode):
-    """Return (text, completion_tokens, prompt_tokens) from OpenAI-style JSON."""
+    """Return (text, completion_tokens, prompt_tokens) from OpenAI-style JSON/SSE.
+
+    TensorRT-LLM versions differ in how /v1/completions streams data. Some use
+    choices[].text, some use chat-like delta.content, and some provide a full
+    JSON object even when stream=True. This extractor is intentionally tolerant.
+    """
     text = ""
     completion_tokens = None
     prompt_tokens = None
 
-    usage = obj.get("usage") if isinstance(obj, dict) else None
-    if usage:
+    if not isinstance(obj, dict):
+        return text, completion_tokens, prompt_tokens
+
+    usage = obj.get("usage")
+    if isinstance(usage, dict):
         completion_tokens = usage.get("completion_tokens", completion_tokens)
+        # Some OpenAI-compatible servers use output_tokens.
+        completion_tokens = usage.get("output_tokens", completion_tokens)
         prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
+        prompt_tokens = usage.get("input_tokens", prompt_tokens)
 
-    choices = obj.get("choices", []) if isinstance(obj, dict) else []
-    for choice in choices:
-        if api_mode == "completion":
-            text += choice.get("text", "") or ""
-        else:
-            # Streaming chat uses delta.content; non-streaming chat uses message.content.
-            delta = choice.get("delta", {}) or {}
-            message = choice.get("message", {}) or {}
-            text += delta.get("content", "") or message.get("content", "") or ""
+    # A few servers put generated text at top-level.
+    for key in ("text", "content", "output_text", "generated_text"):
+        val = obj.get(key)
+        if isinstance(val, str):
+            text += val
+
+    choices = obj.get("choices", [])
+    if isinstance(choices, dict):
+        choices = [choices]
+    for choice in choices if isinstance(choices, list) else []:
+        if not isinstance(choice, dict):
+            continue
+        for key in ("text", "content", "output_text", "generated_text"):
+            val = choice.get(key)
+            if isinstance(val, str):
+                text += val
+
+        delta = choice.get("delta") or {}
+        if isinstance(delta, dict):
+            for key in ("content", "text", "output_text"):
+                val = delta.get(key)
+                if isinstance(val, str):
+                    text += val
+
+        message = choice.get("message") or {}
+        if isinstance(message, dict):
+            for key in ("content", "text"):
+                val = message.get(key)
+                if isinstance(val, str):
+                    text += val
+
+        # Some APIs return token object/list. Only use obvious string payloads.
+        token = choice.get("token")
+        if isinstance(token, str):
+            text += token
+        elif isinstance(token, dict):
+            for key in ("text", "content"):
+                val = token.get(key)
+                if isinstance(val, str):
+                    text += val
+
     return text, completion_tokens, prompt_tokens
-
 
 def _count_output_tokens_fallback(output_text: str, tokenizer_path: Optional[str]) -> int:
     if not output_text:
@@ -239,13 +314,22 @@ def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s, 
         api_mode = "completion"
 
     if api_mode == "completion":
+        prompt, templated_len = apply_chat_template_for_completion(prompt)
+        if templated_len not in (None, -1):
+            prompt_tokens_est = templated_len
+        _debug_print(
+            f"[request {request_id}] Completion prompt prepared: "
+            f"use_chat_template={_env_flag('COMPLETION_USE_CHAT_TEMPLATE', '1')}, "
+            f"prompt_tokens_est={prompt_tokens_est}, prompt_chars={len(prompt)}"
+        )
+
         # /v1/completions maps max_tokens directly to generated tokens in many
         # OpenAI-compatible servers. We use this for very long prompts when the
         # chat endpoint may compute an invalid default_max_tokens internally.
         # Some TensorRT-LLM versions ignore streaming for /v1/completions and
         # return one normal JSON object instead of SSE. The parser below handles
         # both cases.
-        completion_stream = _env_flag("COMPLETION_STREAM", "1")
+        completion_stream = _env_flag("COMPLETION_STREAM", "0")
         payload = {
             "model": model,
             "prompt": prompt,
@@ -373,27 +457,38 @@ def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s, 
                 end = time.perf_counter()
 
             # Normal JSON fallback for /v1/completions when no SSE data arrived.
+            # Some servers send one full JSON object; others send multiple JSON
+            # lines without SSE prefixes. Try both patterns.
             if not output_text and non_sse_lines:
                 raw = "\n".join(non_sse_lines).strip()
-                try:
-                    obj = json.loads(raw)
+                parsed_any = False
+                candidates = [raw] + [x.strip() for x in non_sse_lines if x.strip()]
+                for candidate in candidates:
+                    if not candidate:
+                        continue
+                    try:
+                        obj = json.loads(candidate)
+                    except Exception:
+                        continue
+                    parsed_any = True
                     chunk_text, c_toks, p_toks = _extract_text_and_usage_from_response(obj, api_mode)
                     output_text += chunk_text
                     if c_toks is not None:
                         completion_tokens = c_toks
                     if p_toks is not None:
                         prompt_tokens_reported = p_toks
-                    if output_text and first_token_time is None:
-                        # This is a full-response fallback, so true TTFT is unavailable.
-                        # We use full response latency as an upper bound rather than leaving
-                        # TTFT blank, and the report should label completion-mode TTFT this way.
-                        first_token_time = end
-                        _debug_print(
-                            f"[request {request_id}] Parsed non-SSE JSON response; "
-                            f"TTFT is recorded as full-response upper bound."
-                        )
-                except Exception as parse_exc:
-                    _debug_print(f"[request {request_id}] Could not parse non-SSE response as JSON: {parse_exc!r}")
+                if output_text and first_token_time is None:
+                    # This is a full-response fallback, so true TTFT is unavailable.
+                    # We use full response latency as an upper bound rather than leaving
+                    # TTFT blank, and the report should label completion-mode TTFT this way.
+                    first_token_time = end
+                    _debug_print(
+                        f"[request {request_id}] Parsed non-SSE JSON response; "
+                        f"TTFT is recorded as full-response upper bound."
+                    )
+                elif not parsed_any:
+                    preview = raw[:1000].replace("\n", "\\n")
+                    _debug_print(f"[request {request_id}] Could not parse non-SSE response as JSON. Preview: {preview}")
 
     except Exception as e:
         end = time.perf_counter()
@@ -415,7 +510,12 @@ def run_one_request(url, model, context_len, max_tokens, request_id, timeout_s, 
     # A benchmark request that returns no generated tokens is not a useful pass.
     # This catches parser mismatches and silent empty completions.
     if error is None and max_tokens > 0 and completion_tokens == 0:
-        error = "no_output_tokens_returned_or_parsed"
+        error = f"no_output_tokens_returned_or_parsed_status_{status_code}_api_{api_mode}"
+        _debug_print(
+            f"[request {request_id}] No output tokens parsed. "
+            f"api_mode={api_mode}, status_code={status_code}, output_chars={len(output_text)}, "
+            f"prompt_tokens_est={prompt_tokens_est}"
+        )
 
     tps = completion_tokens / total_time_s if total_time_s > 0 else 0.0
 

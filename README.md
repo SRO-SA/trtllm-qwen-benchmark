@@ -606,3 +606,18 @@ context_len + max_new_tokens + safety_tokens
 ```
 
 If all attempts fail, the script records one clean failure row for the 128K stage instead of multiple duplicate rows.
+
+
+### 128K startup hang protection
+
+The assignment runner includes a startup no-progress watchdog. If `trtllm-serve` stays alive but `/health` never becomes ready and the server log stops changing, the runner records `server_start_hung_no_log_progress`, kills the hung attempt, and moves to the next 128K KV-cache retry value. This prevents the 128K ladder from waiting indefinitely after `Model init total -- ...` with no further log output. Tunables:
+
+```bash
+LONG128_STARTUP_NO_PROGRESS_TIMEOUT_S=300   # default for 128K attempts
+STARTUP_NO_PROGRESS_TIMEOUT_S=600          # default for other stages
+STARTUP_NO_PROGRESS_MIN_ELAPSED_S=180
+```
+
+## Patch note: long-context completions parsing
+
+For 64K and 128K assignment stages, the runner uses `/v1/completions` rather than `/v1/chat/completions` because the TensorRT-LLM 1.1.0 OpenAI chat wrapper can mis-handle very long prompts. The benchmark now applies the model tokenizer's chat template before sending a completion request, uses non-streaming completions by default for long contexts, and parses both `choices[].text` and chat-like `delta.content`/`message.content` fields. This avoids the earlier `no_output_tokens_returned_or_parsed` false failure when the server completed a long-context request but the benchmark did not extract generated text correctly.
