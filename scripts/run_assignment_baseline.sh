@@ -15,7 +15,7 @@ source "$(dirname "$0")/common_env.sh"
 #   1. Prompt generation is tokenizer-aware; character estimates overshot long prompts.
 #   2. TensorRT-LLM PyTorch backend has max_num_tokens separate from max_seq_len.
 #   3. Long-context stages keep assignment context lengths but reduce server overhead:
-#      smaller max_batch_size, smaller CUDA graph batch_sizes, lower KV reservation.
+#      smaller max_batch_size, smaller CUDA graph batch_sizes, and enough KV-cache reservation for the requested context window.
 #   4. Long-context stages use fewer repeated requests/output tokens so the benchmark
 #      does not appear stuck on 64k/128k prefill/generation.
 #   5. Long-context stages disable chunked prefill by default because TensorRT-LLM 1.1.0 PyTorch backend can stall around 64k prompts in the chunked-prefill path.
@@ -308,9 +308,16 @@ fi
 
 SHORT_KV="${SHORT_KV:-0.70}"
 MED_KV="${MED_KV:-0.60}"
-LONG32_KV="${LONG32_KV:-0.25}"
-LONG64_KV="${LONG64_KV:-0.18}"
-LONG128_KV="${LONG128_KV:-0.12}"
+LONG32_KV="${LONG32_KV:-0.30}"
+LONG64_KV="${LONG64_KV:-0.45}"
+LONG128_KV="${LONG128_KV:-0.75}"
+
+# KV cache sizing note:
+# Earlier 64k runs with LONG64_KV=0.18 initialized but only allocated a KV window
+# around 33k tokens, causing default_max_tokens < 0 and a no-progress stall.
+# These defaults reserve enough KV cache for the assignment long-context prompts.
+# If a stage OOMs at server initialization, reduce only that stage's KV fraction and
+# record the OOM as a runtime-stability/scalability limit.
 
 SHORT_BATCH="${SHORT_BATCH:-8}"
 MED_BATCH="${MED_BATCH:-4}"

@@ -62,6 +62,39 @@ def mean_gpu_util(snapshot):
     return statistics.mean(vals) if vals else None
 
 
+def detect_server_log_stall(required_tokens: int) -> str:
+    """Detect TensorRT-LLM long-context stalls from the server log.
+
+    Returns an empty string if no known stall pattern is seen. This prevents
+    spending 15-60 minutes waiting for a request that the server accepted with
+    HTTP 200 but cannot schedule because the KV-cache window is too small.
+    """
+    import re
+    server_log = os.environ.get("SERVER_LOG", "")
+    if not server_log or not os.path.exists(server_log):
+        return ""
+    try:
+        text = open(server_log, errors="ignore").read()[-200000:]
+    except Exception:
+        return ""
+
+    windows = [int(x) for x in re.findall(r"window size=(\d+)", text)]
+    if windows:
+        w = windows[-1]
+        if w < required_tokens:
+            return f"kv_cache_window_too_small_window_{w}_required_{required_tokens}"
+
+    m = re.search(r"default_max_tokens\s*\((-?\d+)\).*?max_seq_len\s*\((\d+)\).*?splited_prompt_len\s*\((\d+)\)", text, re.S)
+    if m:
+        default_max = int(m.group(1))
+        effective_max = int(m.group(2))
+        split_len = int(m.group(3))
+        if default_max < 0:
+            return f"trtllm_default_max_tokens_negative_effective_{effective_max}_prompt_{split_len}"
+
+    return ""
+
+
 def _get_tokenizer(tokenizer_path: Optional[str]):
     global _TOKENIZER, _TOKENIZER_PATH
     if not tokenizer_path:
@@ -366,6 +399,11 @@ def main():
                     f"vram_used_total_gb={vram_now:.2f}; gpu_util_mean={gpu_util}",
                     flush=True,
                 )
+                stall_reason = detect_server_log_stall(args.context_len + args.max_tokens)
+                if stall_reason:
+                    print(f"[heartbeat] Detected server-side long-context stall: {stall_reason}", flush=True)
+                    # Exit with a special code so run_benchmark_grid.sh records a clean failure row.
+                    os._exit(88)
                 last_heartbeat = now
                 continue
 

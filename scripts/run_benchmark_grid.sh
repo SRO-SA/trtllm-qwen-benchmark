@@ -43,6 +43,7 @@ export FIRST_TOKEN_TIMEOUT_S
 export REQUEST_READ_TIMEOUT_S
 export REQUEST_CONNECT_TIMEOUT_S
 export OPENAI_API_MODE
+export SERVER_LOG
 
 echo "======================================"
 echo "TensorRT-LLM benchmark grid"
@@ -122,11 +123,35 @@ while IFS=$'\t' read -r CONTEXT CONCURRENCY EST_TOTAL EST_KV; do
   fi
 
   if [[ "$CASE_STATUS" != "0" ]]; then
-    if [[ "$CASE_STATUS" == "124" || "$CASE_STATUS" == "143" ]]; then
+    if [[ "$CASE_STATUS" == "88" ]]; then
+      REASON="kv_cache_window_too_small_or_default_max_tokens_negative"
+    elif [[ "$CASE_STATUS" == "124" || "$CASE_STATUS" == "143" ]]; then
       REASON="case_timeout_after_${CASE_TIMEOUT_S}s"
     else
       REASON="benchmark_case_failed_exit_${CASE_STATUS}"
     fi
+
+    # Refine the reason using TensorRT-LLM logs when possible.
+    if [[ -n "${SERVER_LOG:-}" && -f "$SERVER_LOG" ]]; then
+      WINDOW_SIZE=$(python3 - "$SERVER_LOG" "$EST_TOTAL" <<'PYLOG' || true
+import re, sys
+log = sys.argv[1]
+required = int(float(sys.argv[2]))
+text = open(log, errors='ignore').read()
+windows = [int(x) for x in re.findall(r'window size=(\d+)', text)]
+if windows:
+    w = windows[-1]
+    if w < required:
+        print(f"kv_cache_window_too_small_window_{w}_required_{required}")
+PYLOG
+)
+      if [[ -n "$WINDOW_SIZE" ]]; then
+        REASON="$WINDOW_SIZE"
+      elif grep -q "default_max_tokens.*should be greater than 0" "$SERVER_LOG"; then
+        REASON="trtllm_default_max_tokens_negative_effective_context_limit"
+      fi
+    fi
+
     echo "ERROR: ${REASON} for context=${CONTEXT}, concurrency=${CONCURRENCY}"
     SERVER_LOG="$SERVER_LOG" bash scripts/diagnose_server.sh || true
     "$PYTHON_BIN" scripts/append_failure_row.py \

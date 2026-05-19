@@ -576,43 +576,9 @@ LONG64_API_MODE=chat LONG128_API_MODE=chat bash scripts/run_assignment_baseline.
 
 The benchmark payload also includes both `max_tokens` and `max_completion_tokens` for chat requests for compatibility across OpenAI-compatible servers.
 
-## Direct TensorRT-LLM API long-context diagnostic
 
-If `trtllm-serve` accepts a 64K request with HTTP 200 but stalls before first token
-with a log like `default_max_tokens (...) = max_seq_len (33056) - splited_prompt_len (...)`,
-run the direct TensorRT-LLM Python API benchmark. This bypasses the OpenAI-compatible
-serving wrapper and calls `LLM.generate(...)` directly.
+## KV cache fix for 64K/128K OpenAI serving
 
-```bash
-bash scripts/stop_trtllm_server.sh || true
+Long-context OpenAI/trtllm-serve stages use context-aware KV-cache reservations. A previous 64K run with `LONG64_KV=0.18` initialized the model but only allocated a KV-cache window of about 33K tokens, which caused `default_max_tokens < 0` and a no-progress stall after HTTP 200. The assignment runner now defaults to `LONG64_KV=0.45` and `LONG128_KV=0.75` and includes log-based detection for `window size=...` and negative `default_max_tokens` warnings.
 
-RESET_RESULTS=1 \
-MODEL_PATH=/workspace/models/Qwen3-Coder-480B-A35B-Instruct-NVFP4 \
-MODEL_NAME=Qwen3-Coder-480B-A35B-Instruct-NVFP4 \
-TOKENIZER_PATH=/workspace/models/Qwen3-Coder-480B-A35B-Instruct-NVFP4 \
-TP_SIZE=4 \
-QUANTIZATION=nvfp4 \
-PROMPT_TOKEN_RESERVE=1024 \
-DIRECT_CONTEXTS="65536" \
-CASE_TIMEOUT_S=5400 \
-BENCHMARK_HEARTBEAT_S=60 \
-PYTHONPATH=$PWD \
-bash scripts/run_assignment_direct_long_context.sh
-```
-
-To also try 128K:
-
-```bash
-DIRECT_CONTEXTS="65536 131072" bash scripts/run_assignment_direct_long_context.sh
-```
-
-Output:
-
-```text
-results/assignment_tensorrt_llm_qwen480b_direct.csv
-results/direct_logs/direct_65536.log
-```
-
-The direct API is diagnostic and does not expose TTFT in the same way as streaming
-OpenAI endpoints. It reports total generation latency, aggregate TPS, VRAM usage,
-and runtime stability.
+If 64K or 128K OOMs at server initialization, reduce only that stage's KV fraction and report the result as a runtime-stability/scalability limit. Do not reduce the assignment context length.
